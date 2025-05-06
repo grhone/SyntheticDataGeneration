@@ -10,7 +10,20 @@ The project includes main script:
 The script:
 - Processes markdown files from the `markdown_docs` directory
 - Splits the content into meaningful sections
-- Generates question-answer pairs with reasoning steps
+- Generates question-answer pairs with reasoning steps, including:
+  - Factual recall questions
+  - Inference questions
+  - Multi-hop reasoning questions
+  - Application/practical use questions
+  - Comparative analysis questions
+  - Cause-effect relationship questions
+  - Summarization questions
+  - Hypothetical scenario questions
+  - Critical analysis questions
+  - Technical explanation questions
+  - Process/workflow questions
+  - True/False and fill-in-the-blank questions
+  - Contextual ambiguity resolution questions
 - Formats the data into different Chain of Thought (CoT) reasoning levels
 - Saves the results as JSON files in the `output` directory
 
