@@ -5,7 +5,7 @@ This repository contains a script to generate synthetic training data from markd
 ## Overview
 
 The project includes main script:
-1. `generate_synthetic_data.py` - An advanced script that uses lmdeploy with InternVL2-8B model to generate sophisticated QA pairs
+1. `generate_synthetic_data.py` - A script that uses lmdeploy with InternVL2-8B model to generate sophisticated QA pairs
 
 The script:
 - Processes markdown files from the `markdown_docs` directory
@@ -97,17 +97,23 @@ The data includes four different formats for each QA pair:
 
 #### lmdeploy Script
 
-The lmdeploy script uses the InternVL2-8B model through lmdeploy to generate sophisticated QA pairs. It:
-1. Sets up the lmdeploy pipeline with the specified model
-2. Extracts the title and content from each section
-3. Sends a prompt to the model asking it to generate a QA pair with reasoning steps
-4. Parses the JSON response
-5. Falls back to the simple heuristic method if there's an error
-6. Formats and saves the data as in the basic script
+The lmdeploy script uses the InternVL2-8B model through lmdeploy to generate QA pairs. It:
+1. Sets up the lmdeploy pipeline with the specified model (or uses simple heuristics if --no-llm flag is set)
+2. Processes each markdown file, splitting content into sections and extracting facts
+3. For each section:
+   - Generates fact-based QA pairs for each extracted fact
+   - Creates a section summary QA pair
+   - Generates additional questions of various types (inference, multi-hop, application, etc.) based on configured distributions
+4. For LLM-generated questions:
+   - Sends carefully crafted prompts to generate specific question types
+   - Parses the JSON response
+   - Falls back to simple heuristics if there's an error
+5. Converts all QA pairs to different Chain of Thought formats (no CoT, 1-step, 2-step, full CoT)
+6. Splits data into training and validation sets, saving as timestamped JSON files
 
 ## Example
 
-If you have a markdown file about Highly Automated Vehicles regulations, the scripts will generate questions like:
+If you have a markdown file about Pennsylvania's Highly Automated Vehicles regulations, the scripts will generate questions like:
 - "What are the requirements for certification of compliance for Highly Automated Vehicles in Pennsylvania?"
 - "What safety measures are required for Highly Automated Vehicles in Pennsylvania?"
 
