@@ -1,2 +1,5 @@
 archive/
 venv/
+.env
+__pycache__/
+section_count_utility.py 

@@ -1,341 +1,269 @@
+"""
+
+Synthetic Training Data Generator for LLM Fine-tuning
+
+This script processes markdown files and generates synthetic question-answer pairs with reasoning steps,
+formatted for training Large Language Models (LLMs). It uses lmdeploy with InternVL3-8B model to generate
+QA pairs with different difficulty levels.
+
+"""
+
+import sys
 import os
 import json
 import random
 import re
-import time
 from typing import List, Dict, Any, Tuple, Optional
-import argparse
-import nest_asyncio
-from enum import Enum, auto
+from dotenv import load_dotenv
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
+from utilities.logger import setup_logger
+from utilities.api_utils import *
+from utilities.file_utils import * 
+from models.question_types import QuestionType, QUESTION_TYPE_DIFFICULTY
+import argparse 
+from utilities.check_image_urls import check_image_urls_in_file, check_all_output_files
+# Load environment variables
+load_dotenv()
 
-# Configuration
-MARKDOWN_DOCS_DIR = "markdown_docs"
-OUTPUT_DIR = "output"
-TRAIN_RATIO = 0.9  # 90% for training, 10% for evaluation
+# Set up env variables
+MARKDOWN_DOCS_DIR = os.environ.get("MARKDOWN_DOCS_DIR", "markdown_docs")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
+MODEL = os.environ.get("MODEL", "OpenGVLab/InternVL3-8B")
+MODEL_FORMAT = os.environ.get("MODEL_FORMAT", None)
+NUM_GPUS = int(os.environ.get("NUM_GPUS", 1))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 50))
+
+# Initialize logging 
+logger = setup_logger(__name__)
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Define question types
-class QuestionType(Enum):
-    FACTUAL_RECALL = auto()
-    INFERENCE = auto()
-    MULTI_HOP_REASONING = auto()
-    APPLICATION = auto()
-    COMPARATIVE_ANALYSIS = auto()
-    CAUSE_EFFECT = auto()
-    SUMMARIZATION = auto()
-    HYPOTHETICAL = auto()
-    CRITICAL_ANALYSIS = auto()
-    TECHNICAL_EXPLANATION = auto()
-    PROCESS_WORKFLOW = auto()
-    TRUE_FALSE_FILL_BLANK = auto()
-    CONTEXTUAL_AMBIGUITY = auto()
-    
-    # Original question types
-    FACT_BASED = auto()
-    SECTION_SUMMARY = auto()
+# Initialize the failed sections
+failed_sections = []
 
-# Define difficulty levels
-class DifficultyLevel(Enum):
-    EASY = "easy"
-    MEDIUM = "medium"
-    HARD = "hard"
+def extract_image_references(section_content: str) -> List[str]:
+    """Extract image references like {{FIGURE_5.2}} from section content."""
+    pattern = r'\{\{([^}]+)\}\}'
+    return re.findall(pattern, section_content)
 
-# Question type distribution (percentages)
-QUESTION_TYPE_DISTRIBUTION = {
-    QuestionType.FACTUAL_RECALL: 15,
-    QuestionType.INFERENCE: 10,
-    QuestionType.MULTI_HOP_REASONING: 5,
-    QuestionType.APPLICATION: 8,
-    QuestionType.COMPARATIVE_ANALYSIS: 5,
-    QuestionType.CAUSE_EFFECT: 5,
-    QuestionType.SUMMARIZATION: 5,
-    QuestionType.HYPOTHETICAL: 5,
-    QuestionType.CRITICAL_ANALYSIS: 5,
-    QuestionType.TECHNICAL_EXPLANATION: 10,
-    QuestionType.PROCESS_WORKFLOW: 5,
-    QuestionType.TRUE_FALSE_FILL_BLANK: 10,
-    QuestionType.CONTEXTUAL_AMBIGUITY: 5,
-    # Original question types are handled separately
-}
+def resolve_image_paths(image_refs: List[str], document_name: str) -> List[str]:
+    """Convert image references to actual file paths."""
+    image_paths = []
+    for ref in image_refs:
+        # Try different possible paths
+        possible_paths = [
+            os.path.join(document_name, f"{ref}.png"),
+            os.path.join(document_name, f"{ref}.jpg"),
+            os.path.join(document_name, f"{ref}.jpeg"),
+            os.path.join(MARKDOWN_DOCS_DIR, document_name, f"{ref}.png"),
+            os.path.join(MARKDOWN_DOCS_DIR, document_name, f"{ref}.jpg"),
+            os.path.join(MARKDOWN_DOCS_DIR, document_name, f"{ref}.jpeg"),
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                image_paths.append(path)
+                logger.debug(f"Found image: {path}")
 
-# Difficulty distribution (percentages)
-DIFFICULTY_DISTRIBUTION = {
-    DifficultyLevel.EASY: 60,
-    DifficultyLevel.MEDIUM: 30,
-    DifficultyLevel.HARD: 10,
-}
-
-# Question type to difficulty mapping
-QUESTION_TYPE_DIFFICULTY = {
-    QuestionType.FACTUAL_RECALL: DifficultyLevel.EASY,
-    QuestionType.INFERENCE: DifficultyLevel.MEDIUM,
-    QuestionType.MULTI_HOP_REASONING: DifficultyLevel.HARD,
-    QuestionType.APPLICATION: DifficultyLevel.MEDIUM,
-    QuestionType.COMPARATIVE_ANALYSIS: DifficultyLevel.MEDIUM,
-    QuestionType.CAUSE_EFFECT: DifficultyLevel.MEDIUM,
-    QuestionType.SUMMARIZATION: DifficultyLevel.EASY,
-    QuestionType.HYPOTHETICAL: DifficultyLevel.HARD,
-    QuestionType.CRITICAL_ANALYSIS: DifficultyLevel.HARD,
-    QuestionType.TECHNICAL_EXPLANATION: DifficultyLevel.MEDIUM,
-    QuestionType.PROCESS_WORKFLOW: DifficultyLevel.EASY,
-    QuestionType.TRUE_FALSE_FILL_BLANK: DifficultyLevel.EASY,
-    QuestionType.CONTEXTUAL_AMBIGUITY: DifficultyLevel.HARD,
-    QuestionType.FACT_BASED: DifficultyLevel.EASY,
-    QuestionType.SECTION_SUMMARY: DifficultyLevel.MEDIUM,
-}
-
-# Set up argument parser
-parser = argparse.ArgumentParser(description='Generate synthetic training data from markdown files')
-parser.add_argument('--model', type=str, default='OpenGVLab/InternVL3-8B', help='Model to use')
-parser.add_argument('--max-tokens', type=int, default=4096, help='Maximum tokens for model response')
-parser.add_argument('--temperature', type=float, default=0.7, help='Temperature for model response')
-parser.add_argument('--no-llm', action='store_true', help='Use simple heuristics instead of LLM')
-args = parser.parse_args()
-
-def read_markdown_file(file_path: str) -> str:
-    """Read content from a markdown file."""
-    with open(file_path, 'r', encoding='utf-8') as file:
-        return file.read()
-
-def split_into_sections(content: str) -> List[str]:
-    """Split the markdown content into meaningful sections."""
-    # Split by headers (# or ## or ###)
-    sections = re.split(r'(?=^#+ )', content, flags=re.MULTILINE)
-    # Filter out empty sections and sections with just "NO_CONTENT_HERE"
-    return [section.strip() for section in sections if section.strip() and "NO_CONTENT_HERE" not in section]
-
-def extract_facts_from_section(section: str) -> List[str]:
-    """Extract individual facts from a section."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # List to store extracted facts
-    facts = []
-    
-    # Split content into paragraphs
-    paragraphs = re.split(r'\n\s*\n', content)
-    
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-            
-        # Check if this is a numbered or bulleted list
-        if re.match(r'^\s*(\d+\.|\*|\-)\s', paragraph):
-            # Process list items
-            list_items = process_list_items(paragraph)
-            facts.extend(list_items)
+                break
         else:
-            # Process regular paragraph
-            sentences = split_into_sentences(paragraph)
-            facts.extend(sentences)
+            logger.warning(f"Image not found for reference {ref} in document {document_name}")
     
-    # Filter out empty facts and very short ones (likely not complete facts)
-    facts = [fact.strip() for fact in facts if len(fact.strip()) > 10]
-    
-    # If no facts were extracted (maybe the section was too short), use the whole content as one fact
-    if not facts and content.strip():
-        facts = [content.strip()]
-    
-    return facts
+    return image_paths
 
-def process_list_items(list_text: str) -> List[str]:
-    """Process a list into individual fact items."""
-    facts = []
+def attach_images_to_section(section: str, document_name: str) -> Tuple[str, List[str]]:
+    """Process a section to find and attach images, returning updated content and image paths."""
+    image_refs = extract_image_references(section)
+    image_paths = resolve_image_paths(image_refs, document_name)
     
-    # Split the list text into lines
-    lines = list_text.split('\n')
+    return section, image_paths
+
+def find_closest_sections(section: str, sections: List[str], section_idx: int) -> List[Dict[str, Any]]:
+
+    # Preprocess sections for KNN
+    section_texts = [sec[:2000] for sec in sections]  # Limit text length
+    current_section_idx = section_idx - 1  # Convert to 0-based index
     
-    # Current parent item for context
-    current_parent = ""
-    parent_indent = 0
+    # Initialize TF-IDF and KNN
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=500)
+    tfidf_matrix = vectorizer.fit_transform(section_texts)
     
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    # Find 3 most similar sections (excluding current section)
+    knn = NearestNeighbors(n_neighbors=min(3, len(section_texts)-1), metric='cosine')
+    knn.fit(tfidf_matrix)
+    
+    # Get nearest neighbors (excluding self)
+    fact_vec = vectorizer.transform([section])
+    distances, indices = knn.kneighbors(fact_vec)
+    
+    relevant_sections = []
+    for idx in indices[0]:
+        if idx != current_section_idx:  # Skip current section
+            relevant_sections.append(section_texts[idx])
+
+    return relevant_sections
+
+def get_closest_sections_text(section: str, sections: List[str], section_idx: int, document_name: str = "") -> Tuple[str, List[str]]:
+    """Get text of closest sections and their image paths.
+    Returns tuple of (section_text, image_paths)"""
+    relevant_sections = find_closest_sections(section, sections, section_idx)
+    
+    processed_sections = []
+    all_image_paths = []
+    
+    for sec in relevant_sections:
+        # Process images in each section
+        sec_content, image_paths = attach_images_to_section(sec, document_name)
+        processed_sections.append(sec_content)
+        all_image_paths.extend(image_paths)
+    
+    relevant_sections_text = '\n\n'.join(processed_sections) if processed_sections else 'No additional relevant sections found'
+        
+    return relevant_sections_text, all_image_paths
+
+def generate_qa_pairs_bulk(pipe, sections: List[str], section_indices: List[int], question_type: QuestionType, all_sections: List[str], doc_metadata: Dict[str, Any], document_name: str = "") -> List[Dict[str, Any]]:
+    """Generate QA pairs in bulk for multiple sections with image support."""
+    prompts = []
+    metadata = []
+    
+    # Get document title from metadata or use filename
+    doc_title = doc_metadata.get('title', 'the document')
+    
+    # Add metadata to prompt context
+    metadata_context = ""
+    if doc_metadata:
+        metadata_context = "\nDOCUMENT METADATA:\n"
+        for k, v in doc_metadata.items():
+            metadata_context += f"- {k}: {v}\n"
+        metadata_context += "\n"
+
+    # Prepare prompts for each section
+    for section, section_idx in zip(sections, section_indices):
+
+        logger.debug(f"Creating prompt for section {section_idx}...")
+        
+        # Process images in the section
+        section_content, section_image_paths = attach_images_to_section(section, document_name)
+        
+        # Get related sections and their images
+        relevant_sections_text, related_image_paths = get_closest_sections_text(
+            section_content, all_sections, section_idx, document_name
+        )
+
+        # Combine all image paths
+        all_image_paths = section_image_paths + related_image_paths
+        
+        # Create image context for prompts
+        image_context = ""
+        if all_image_paths:
+            image_context = f"\nIMAGES ATTACHED TO THIS SECTION:\n"
+            for i, path in enumerate(all_image_paths):
+                image_name = os.path.splitext(os.path.basename(path))[0]  # Get name without extension
+                image_context += f"Image {image_name}: {path}\n"
+            image_context += "Note: The attached images provide visual context for the questions and answers. Please reference them appropriately in your responses.\n\n"
+
+        facts = extract_facts_from_section(section_content)
+
+
+        # Extract the section title if it exists
+        title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
+        title = title_match.group(1).strip() if title_match else "Section"
+        
+        # Extract the content without the title
+        content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
+        
+        # Modify all prompt templates to include this instruction:
+        common_instructions = f"""
+ADDITIONAL INSTRUCTIONS:
+1. Always refer to the document in third person as "{doc_title}" (e.g., "According to {doc_title}" instead of "According to the document")
+2. Never use first-person references like "I", "we", or "our document"
+3. Maintain an objective, third-person perspective throughout
+4. Do not refer to figures or tables directly. Only use the information in the exhibit to provide information for the questions and answers. Any time an exhibit is referred to in an answer, the document name should be included so a user knows where to look.
+5. Images should only be added to the final JSON if they are example ATSPM charts to be interpereted by the answer. Images should refer to real files.
+"""
+        
+        # Create prompt based on question type
+        if question_type == QuestionType.FACT_BASED:
+
+            for fact_idx, fact in enumerate(facts):
+
+                logger.debug(f"Creating prompt for fact {fact_idx} for section {section_idx}...")
+
+                relevant_sections_text_for_fact = get_closest_sections_text(fact, all_sections, section_idx, document_name=document_name)
             
-        # Calculate indentation level
-        indent = len(line) - len(line.lstrip())
-        
-        # Check if this is a list item
-        list_item_match = re.match(r'^\s*(\d+\.|\*|\-)\s+(.*)', line)
-        if list_item_match:
-            marker, item_text = list_item_match.groups()
-            
-            # If this is a sub-item, include the parent context
-            if indent > parent_indent:
-                fact = f"{current_parent} - {item_text}"
-            else:
-                # This is a top-level item or a new sub-list
-                fact = item_text
-                current_parent = item_text
-                parent_indent = indent
-                
-            facts.append(fact)
-        else:
-            # This is continuation text for the previous item
-            if facts:
-                facts[-1] += " " + line
-    
-    return facts
+                prompt = f"""
+For the following fact from a document, generate a self-contained question/answer pair using the provided context.
 
-def split_into_sentences(text: str) -> List[str]:
-    """
-    Split text into sentences, handling abbreviations and special cases.
-    """
-    # Protect common abbreviations from being split
-    protected_text = text
-    protected_text = re.sub(r'(\w\.\w\.)', r'\1PROTECTED', protected_text)  # Protect abbreviations like U.S.
-    protected_text = re.sub(r'(\d+\.\d+)', r'\1PROTECTED', protected_text)  # Protect decimal numbers
-    protected_text = re.sub(r'([A-Za-z]\.[A-Za-z]\.)', r'\1PROTECTED', protected_text)  # Protect Pa.C.S.
-    
-    # Split on sentence boundaries
-    sentence_boundaries = r'(?<=[.!?])\s+'
-    raw_sentences = re.split(sentence_boundaries, protected_text)
-    
-    # Restore protected text
-    sentences = [re.sub(r'PROTECTED', '', s) for s in raw_sentences]
-    
-    # Further process sentences to handle special cases
-    processed_sentences = []
-    for sentence in sentences:
-        # Skip empty sentences
-        if not sentence.strip():
-            continue
-            
-        # Handle sentences that might have been incorrectly split
-        if re.match(r'^[a-z]', sentence) and processed_sentences:
-            # This sentence starts with lowercase, likely continuation of previous
-            processed_sentences[-1] += " " + sentence
-        else:
-            processed_sentences.append(sentence)
-    
-    return processed_sentences
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
 
-def get_json_str(string: str) -> str:
-    """Extract JSON string from text."""
-    first = string.find('{')
-    last = string.rfind('}')
-    if first == -1 or last == -1 or first > last:
-        raise ValueError("Input string does not contain valid JSON object braces.")
-    return string[first:last + 1]
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text_for_fact}
 
-def setup_lmdeploy_pipeline():
-    """Set up and return the lmdeploy pipeline."""
-    try:
-        from lmdeploy import pipeline, TurbomindEngineConfig, ChatTemplateConfig, GenerationConfig
-        
-        # Apply nest_asyncio to allow nested event loops
-        nest_asyncio.apply()
-        
-        # System prompt for the model
-        system_prompt = 'You are a knowledgeable and helpful teacher who generates detailed JSON responses for questions, integrating specific writing styles from provided text without directly referencing the original document.'
-        
-        # Initialize chat template configuration
-        chat_template_config = ChatTemplateConfig('internvl2_5')
-        chat_template_config.meta_instruction = system_prompt
-        
-        # Initialize backend configuration
-        backend_config = TurbomindEngineConfig(tp=2)
-        
-        # Create the pipeline with the provided configurations
-        pipe = pipeline(args.model, chat_template_config=chat_template_config, backend_config=backend_config)
-        
-        return pipe
-    except ImportError as e:
-        print(f"Error importing lmdeploy: {e}")
-        print("Please install lmdeploy with: pip install lmdeploy[all]")
-        return None
-    except Exception as e:
-        print(f"Error setting up lmdeploy pipeline: {e}")
-        return None
+FACT TO BASE QUESTION ON:
+{fact}
 
-def generate_fact_qa_pair_with_lmdeploy(pipe, fact: str, section_index: int, fact_index: int) -> Dict[str, Any]:
-    """Generate a question-answer pair for a single fact using lmdeploy."""
-    # Prepare the prompt
-    prompt = f"""
-For the following fact from a document about Highly Automated Vehicles (HAV) regulations, generate a self-contained question/answer pair. Reflect the writing style, tone, and thematic elements of the original document without directly referencing or quoting the text. Follow these steps:
+{image_context}
 
-1. Analyze the fact's style, including language patterns, tone, and structure.
-2. Create a question that specifically targets this single fact, ensuring it is self-contained and independent of the original text.
-3. Provide a detailed answer that reflects the document's style and thoroughly explains the concept.
+INSTRUCTIONS:
+1. Analyze the fact's context and style, including language patterns and tone.
+2. Create a question that specifically targets this fact while being self-contained.
+3. Provide a detailed answer that reflects the document's style and uses context when needed.
 4. Use markdown format for the answer where appropriate.
+5. Only reference the context when absolutely necessary for clarity.
+6. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
-Ensure all outputs are independent of the original text context. The question and answer should appear as standalone general knowledge content. Use the following JSON format:
-
+Use this JSON format:
 {{
-  "section_number": "{section_index}",
-  "fact_number": "{fact_index}",
-  "question_type": "FACT_BASED",
-  "difficulty": "EASY",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
+    "<Step 1: How context informs the question>",
+    "<Step 2: Key elements from fact>", 
+    "<Step 3: How to formulate answer>"
   ]
 }}
-
-Here is the fact:
-
-{fact}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating fact QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_fact_qa_pair_simple(fact, section_index, fact_index)
+                
+                prompts.append(prompt)
+                metadata.append({
+                    "section_idx": section_idx,
+                    "fact_number": fact_idx,
+                    "question_type": question_type.name,
+                    "difficulty": QUESTION_TYPE_DIFFICULTY[question_type].value
+                })
+        elif question_type == QuestionType.SECTION_SUMMARY:
+            prompt = f"""
+For the following section from a document, generate a summary question/answer pair. The question should ask for a comprehensive summary of the section, and the answer should summarize all key information in the section. Reflect the writing style, tone, and thematic elements of the original document without directly referencing or quoting the text. Follow these steps:
 
-def generate_section_summary_qa_pair_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a summary question-answer pair for a section using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following section from a document about Highly Automated Vehicles (HAV) regulations, generate a summary question/answer pair. The question should ask for a comprehensive summary of the section, and the answer should summarize all key information in the section. Reflect the writing style, tone, and thematic elements of the original document without directly referencing or quoting the text. Follow these steps:
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 1. Analyze the section's style, including language patterns, tone, and structure.
 2. Create a question that asks for a summary of the key information in this section.
 3. Provide a detailed answer that summarizes all important information in the section.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Ensure all outputs are independent of the original text context. The question and answer should appear as standalone general knowledge content. Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "is_summary": true,
-  "question_type": "SECTION_SUMMARY",
-  "difficulty": "MEDIUM",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -350,244 +278,36 @@ Here is the section:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating section summary QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_section_summary_qa_pair_simple(section, section_index)
+        elif question_type == QuestionType.FACTUAL_RECALL:
 
-def generate_qa_pair_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """
-    Legacy function maintained for compatibility.
-    Generate a question-answer pair with reasoning steps using lmdeploy.
-    """
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following paragraph from a document about Highly Automated Vehicles (HAV) regulations, generate a self-contained question/answer pair. Reflect the writing style, tone, and thematic elements of the original document without directly referencing or quoting the text. Follow these steps:
+            fact = random.choice(facts) if facts else content[:500]
 
-1. Analyze the paragraph's style, including language patterns, tone, and structure.
-2. Create a question based on the implicit themes or knowledge in the paragraph, ensuring it is self-contained and independent of the original text.
-3. Provide a detailed answer that reflects the document's style and thoroughly explains the concept.
-4. Use markdown format for the answer where appropriate.
+            prompt = f"""
+For the following document section, generate a factual recall question that can be answered by directly quoting 1-2 sentences from the document. The question should test the reader's ability to locate and recall explicit information from the text.
 
-Ensure all outputs are independent of the original text context. The question and answer should appear as standalone general knowledge content. Use the following JSON format:
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
 
-{{
-  "paragraph_number": "{section_index}",
-  "question_type": "FACT_BASED",
-  "difficulty": "EASY",
-  "question": "<text>",
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
-}}
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
 
-Here is the paragraph:
-
-{title}
-
-{content}
-"""
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_qa_pair_simple(section, section_index)
-
-def generate_fact_qa_pair_simple(fact: str, section_index: int, fact_index: int) -> Dict[str, Any]:
-    """Generate a question-answer pair for a single fact using simple heuristics."""
-    # Simple heuristic to generate a question based on the fact
-    if "definition" in fact.lower():
-        question = f"What is the definition related to Highly Automated Vehicles mentioned in this fact?"
-    elif "certification" in fact.lower():
-        question = f"What certification requirement is mentioned in this fact about Highly Automated Vehicles?"
-    elif "safety" in fact.lower():
-        question = f"What safety measure for Highly Automated Vehicles is described in this fact?"
-    elif "emergency" in fact.lower():
-        question = f"What emergency procedure related to Highly Automated Vehicles is mentioned in this fact?"
-    elif "prohibition" in fact.lower():
-        question = f"What prohibition regarding Highly Automated Vehicles is described in this fact?"
-    elif "reporting" in fact.lower():
-        question = f"What reporting requirement for Highly Automated Vehicles is mentioned in this fact?"
-    else:
-        # Extract first few words to create a question
-        words = fact.split()[:3]
-        topic = " ".join(words)
-        question = f"What does the Pennsylvania Department of Transportation guideline say about {topic}?"
-    
-    # Generate an answer based on the fact
-    answer = f"According to the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles: {fact}"
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the key information in this specific fact.",
-        f"This fact contains important information about a specific aspect of Highly Automated Vehicles regulation.",
-        f"Based on this fact, I can provide a precise answer about this specific aspect of Highly Automated Vehicles in Pennsylvania."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "fact_number": str(fact_index),
-        "question_type": "FACT_BASED",
-        "difficulty": "EASY",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
-
-def generate_section_summary_qa_pair_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a summary question-answer pair for a section using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Generate a summary question based on the title
-    question = f"Can you summarize the key points about {title} in the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles?"
-    
-    # Generate a summary answer based on the content
-    # For simplicity, we'll use the first 500 characters as a summary
-    answer = f"The Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles provide the following key information about {title.lower()}: {content[:500]}..."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the main topic of this section, which is {title.lower()}.",
-        f"Next, I need to extract the key points about {title.lower()} from the Pennsylvania guidelines.",
-        f"Finally, I can summarize these key points to provide a comprehensive overview of {title.lower()} in the context of Highly Automated Vehicles in Pennsylvania."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "is_summary": True,
-        "question_type": "SECTION_SUMMARY",
-        "difficulty": "MEDIUM",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
-
-def generate_qa_pair_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """
-    Legacy function maintained for compatibility.
-    Generate a question-answer pair with reasoning steps using simple heuristics.
-    """
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Simple heuristic to generate a question based on the title
-    if "definition" in title.lower() or "definitions" in title.lower():
-        question = f"What is the definition of a term related to Highly Automated Vehicles in the Pennsylvania guidelines?"
-    elif "certification" in title.lower():
-        question = f"What are the requirements for certification of compliance for Highly Automated Vehicles in Pennsylvania?"
-    elif "safety" in title.lower():
-        question = f"What safety measures are required for Highly Automated Vehicles in Pennsylvania?"
-    elif "emergency" in title.lower():
-        question = f"What procedures should Emergency Service Responders follow when interacting with Highly Automated Vehicles?"
-    elif "prohibition" in title.lower():
-        question = f"What operations are prohibited for Highly Automated Vehicles in Pennsylvania?"
-    elif "reporting" in title.lower():
-        question = f"What reporting requirements exist for Certificate Holders of Highly Automated Vehicles in Pennsylvania?"
-    else:
-        question = f"What does the Pennsylvania Department of Transportation guideline say about {title}?"
-    
-    # Generate an answer based on the content
-    answer = f"According to the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles, {title.lower()} involves the following: {content[:500]}..."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify what the Pennsylvania guidelines say about {title.lower()}.",
-        f"The guidelines specify several key points about {title.lower()}, including regulatory requirements and procedures.",
-        f"Based on these guidelines, I can provide a comprehensive answer about {title.lower()} in the context of Highly Automated Vehicles in Pennsylvania."
-    ]
-    
-    return {
-        "paragraph_number": str(section_index),
-        "question_type": "FACT_BASED",
-        "difficulty": "EASY",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
-
-# New functions for generating different question types
-
-def generate_factual_recall_qa_with_lmdeploy(pipe, facts: List[str], section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a factual recall question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Select a random fact from the section
-    fact = random.choice(facts) if facts else content[:500]
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a factual recall question that can be answered by directly quoting 1-2 sentences from the document. The question should test the reader's ability to locate and recall explicit information from the text.
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify key facts, definitions, or statements.
 2. Create a question that targets specific information that can be directly quoted from the text.
 3. Provide an answer that includes exact text excerpts.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "FACTUAL_RECALL",
-  "difficulty": "EASY",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -606,54 +326,33 @@ And here is a specific fact from this section that you might focus on:
 
 {fact}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating factual recall QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_factual_recall_qa_simple(facts, section, section_index)
+        elif question_type == QuestionType.INFERENCE:
+            prompt = f"""
+For the following document section, generate an inference question that requires logical reasoning from the text. The question should test the reader's ability to understand implicit information and draw conclusions that are not explicitly stated.
 
-def generate_inference_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate an inference question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate an inference question that requires logical reasoning from the text. The question should test the reader's ability to understand implicit information and draw conclusions that are not explicitly stated.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify underlying principles, implications, or connections.
 2. Create a question that requires connecting ideas or inferring meaning beyond what is directly stated.
 3. Provide an answer that explains the logical reasoning process without directly quoting the text.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "INFERENCE",
-  "difficulty": "MEDIUM",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -668,65 +367,60 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating inference QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_inference_qa_simple(section, section_index)
+        elif question_type == QuestionType.MULTI_HOP_REASONING:
 
-def generate_multi_hop_qa_with_lmdeploy(pipe, sections: List[str], section_index: int) -> Dict[str, Any]:
-    """Generate a multi-hop reasoning question-answer pair using lmdeploy."""
-    # Need at least two sections for multi-hop reasoning
-    if len(sections) < 2:
-        return None
+            # Need at least two sections for multi-hop reasoning
+            if len(all_sections) < 2:
+                # TODO: SKIP THIS SECTION
+                return None
+            
+            # Use current section and select one other random section
+            section1 = section
+            other_sections = [s for s in all_sections if s != section]
+            section2 = random.choice(other_sections) if other_sections else None
+            
+            if not section2:
+                return None
+            
+            # TODO: ATTACH IMAGES FOR ALL THE OHTER SECTIONS IN HERE
+            
+            # Extract the section titles if they exist
+            title_match1 = re.match(r'^#+ (.*?)$', section1, re.MULTILINE)
+            title1 = title_match1.group(1).strip() if title_match1 else "Section A"
+            
+            title_match2 = re.match(r'^#+ (.*?)$', section2, re.MULTILINE)
+            title2 = title_match2.group(1).strip() if title_match2 else "Section B"
     
-    # Select two random sections
-    section1, section2 = random.sample(sections, 2)
-    
-    # Extract the section titles if they exist
-    title_match1 = re.match(r'^#+ (.*?)$', section1, re.MULTILINE)
-    title1 = title_match1.group(1).strip() if title_match1 else "Section A"
-    
-    title_match2 = re.match(r'^#+ (.*?)$', section2, re.MULTILINE)
-    title2 = title_match2.group(1).strip() if title_match2 else "Section B"
-    
-    # Extract the content without the titles
-    content1 = re.sub(r'^#+ .*?$', '', section1, count=1, flags=re.MULTILINE).strip()
-    content2 = re.sub(r'^#+ .*?$', '', section2, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following two document sections about Highly Automated Vehicles (HAV) regulations, generate a multi-hop reasoning question that requires combining information from both sections. The question should test the reader's ability to connect ideas across different parts of the document.
+            # Extract the content without the titles
+            content1 = re.sub(r'^#+ .*?$', '', section1, count=1, flags=re.MULTILINE).strip()
+            content2 = re.sub(r'^#+ .*?$', '', section2, count=1, flags=re.MULTILINE).strip()
+            
+            prompt = f"""
+For the following two document sections, generate a multi-hop reasoning question that requires combining information from both sections. The question should test the reader's ability to connect ideas across different parts of the document.
+
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze both sections to identify related concepts or complementary information.
 2. Create a question that requires integrating knowledge from both sections to answer correctly.
 3. Provide an answer that explains how information from both sections contributes to the solution.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "MULTI_HOP_REASONING",
-  "difficulty": "HARD",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -743,54 +437,33 @@ Section 1: {title1}
 Section 2: {title2}
 {content2}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating multi-hop reasoning QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_multi_hop_qa_simple(sections, section_index)
+        elif question_type == QuestionType.APPLICATION:
+            prompt = f"""
+For the following document section, generate a scenario-based question asking how to apply a concept from the document. The question should test the reader's ability to apply theoretical knowledge to practical situations.
 
-def generate_application_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate an application/practical use question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a scenario-based question asking how to apply a concept from the document. The question should test the reader's ability to apply theoretical knowledge to practical situations.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify concepts, procedures, or guidelines that could be applied in real-world scenarios.
 2. Create a question that presents a realistic scenario where this knowledge would need to be applied.
 3. Provide a step-by-step answer that explains how to apply the concept in the given scenario.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "APPLICATION",
-  "difficulty": "MEDIUM",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -805,65 +478,58 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating application QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_application_qa_simple(section, section_index)
+        elif question_type == QuestionType.COMPARATIVE_ANALYSIS:
 
-def generate_comparative_analysis_qa_with_lmdeploy(pipe, sections: List[str], section_index: int) -> Dict[str, Any]:
-    """Generate a comparative analysis question-answer pair using lmdeploy."""
-    # Need at least two sections for comparative analysis
-    if len(sections) < 2:
-        return None
+            # Need at least two sections for multi-hop reasoning
+            if len(all_sections) < 2:
+                # TODO: SKIP THIS SECTION
+                return None
+            
+            # Use current section and select one other random section
+            section1 = section
+            other_sections = [s for s in all_sections if s != section]
+            section2 = random.choice(other_sections) if other_sections else None
+            
+            if not section2:
+                return None
+            
+            # Extract the section titles if they exist
+            title_match1 = re.match(r'^#+ (.*?)$', section1, re.MULTILINE)
+            title1 = title_match1.group(1).strip() if title_match1 else "Section A"
+            
+            title_match2 = re.match(r'^#+ (.*?)$', section2, re.MULTILINE)
+            title2 = title_match2.group(1).strip() if title_match2 else "Section B"
     
-    # Select two random sections
-    section1, section2 = random.sample(sections, 2)
-    
-    # Extract the section titles if they exist
-    title_match1 = re.match(r'^#+ (.*?)$', section1, re.MULTILINE)
-    title1 = title_match1.group(1).strip() if title_match1 else "Section A"
-    
-    title_match2 = re.match(r'^#+ (.*?)$', section2, re.MULTILINE)
-    title2 = title_match2.group(1).strip() if title_match2 else "Section B"
-    
-    # Extract the content without the titles
-    content1 = re.sub(r'^#+ .*?$', '', section1, count=1, flags=re.MULTILINE).strip()
-    content2 = re.sub(r'^#+ .*?$', '', section2, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following two document sections about Highly Automated Vehicles (HAV) regulations, generate a comparative analysis question that asks the reader to compare two concepts or approaches. The question should test the reader's ability to identify similarities and differences between related ideas.
+            # Extract the content without the titles
+            content1 = re.sub(r'^#+ .*?$', '', section1, count=1, flags=re.MULTILINE).strip()
+            content2 = re.sub(r'^#+ .*?$', '', section2, count=1, flags=re.MULTILINE).strip()
+
+            prompt = f"""
+For the following two document sections, generate a comparative analysis question that asks the reader to compare two concepts or approaches. The question should test the reader's ability to identify similarities and differences between related ideas.
+
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze both sections to identify concepts, approaches, or requirements that can be meaningfully compared.
 2. Create a question that asks for a comparison, highlighting specific aspects to focus on.
 3. Provide an answer that systematically analyzes similarities and differences.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "COMPARATIVE_ANALYSIS",
-  "difficulty": "MEDIUM",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -880,54 +546,33 @@ Section 1: {title1}
 Section 2: {title2}
 {content2}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating comparative analysis QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_comparative_analysis_qa_simple(sections, section_index)
+        elif question_type == QuestionType.CAUSE_EFFECT:
+            prompt = f"""
+For the following document section, generate a question about cause-effect chains described in the document. The question should test the reader's ability to understand causal relationships and their implications.
 
-def generate_cause_effect_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a cause-effect relationship question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a question about cause-effect chains described in the document. The question should test the reader's ability to understand causal relationships and their implications.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify cause-effect relationships, where one event or condition leads to specific outcomes.
 2. Create a question that asks about these causal relationships, focusing on why certain effects occur.
 3. Provide an answer that explains the causal chain, citing specific parts of the document.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "CAUSE_EFFECT",
-  "difficulty": "MEDIUM",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -942,54 +587,33 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating cause-effect QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_cause_effect_qa_simple(section, section_index)
+        elif question_type == QuestionType.SUMMARIZATION:
+            prompt = f"""
+For the following document section, generate a summarization question that asks for a concise summary of multi-page content. The question should test the reader's ability to identify and synthesize key information.
 
-def generate_summarization_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a summarization question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a summarization question that asks for a concise summary of multi-page content. The question should test the reader's ability to identify and synthesize key information.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify the main topics, key points, and essential information.
 2. Create a question that asks for a concise summary of specific aspects of the content.
 3. Provide an answer that summarizes the requested information in under 100 words.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "SUMMARIZATION",
-  "difficulty": "EASY",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1004,54 +628,33 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating summarization QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_summarization_qa_simple(section, section_index)
+        elif question_type == QuestionType.HYPOTHETICAL:
+            prompt = f"""
+For the following document section, generate a 'what-if' question that extends document concepts to new situations. The question should test the reader's ability to apply principles from the document to hypothetical scenarios.
 
-def generate_hypothetical_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a hypothetical scenario question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a 'what-if' question that extends document concepts to new situations. The question should test the reader's ability to apply principles from the document to hypothetical scenarios.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify key principles, rules, or guidelines that could be applied to new situations.
 2. Create a hypothetical scenario that extends beyond what is explicitly covered in the document.
 3. Provide a plausible speculative answer based on the principles established in the document.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "HYPOTHETICAL",
-  "difficulty": "HARD",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1066,113 +669,33 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating hypothetical QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_hypothetical_qa_simple(section, section_index)
+        elif question_type == QuestionType.CRITICAL_ANALYSIS:
+            prompt = f"""
+For the following document section, generate a critical analysis question that prompts evaluation of the document content. The question should test the reader's ability to critically assess the strengths and weaknesses of the material.
 
-def generate_hypothetical_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a hypothetical scenario question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate a hypothetical question
-    question = f"What if a Highly Automated Vehicle encounters a situation not explicitly covered in the {title.lower()} section of the Pennsylvania guidelines? How might the principles in this section be applied to this novel scenario?"
-    
-    # Generate an answer based on hypothetical scenario
-    answer = f"If a Highly Automated Vehicle encounters a situation not explicitly covered in the {title.lower()} section, the underlying principles would still apply. The vehicle would need to prioritize safety, follow the general intent of the guidelines, and implement a reasonable interpretation of the requirements. Specifically, it would need to: 1) Apply the closest analogous rule from the guidelines; 2) Default to the most conservative safety approach; 3) Document the situation for future regulatory consideration; and 4) Ensure that its response aligns with the overall regulatory framework's goals of ensuring public safety while enabling technological advancement."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the core principles and intent behind the {title.lower()} requirements in the guidelines.",
-        f"Next, I need to extrapolate how these principles would logically extend to situations not explicitly covered.",
-        f"Finally, I can formulate a plausible response based on the document's overall regulatory philosophy and safety priorities."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "HYPOTHETICAL",
-        "difficulty": "HARD",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
 
-def generate_summarization_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a summarization question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Generate a summarization question
-    question = f"Provide a concise summary (under 100 words) of the key points regarding {title.lower()} in the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles."
-    
-    # Generate a summary answer
-    answer = f"The Pennsylvania guidelines on {title.lower()} for Highly Automated Vehicles can be summarized as follows: The section establishes key requirements for {title.lower()}, emphasizing safety protocols, compliance standards, and procedural requirements. It outlines responsibilities for operators, testing parameters, and documentation needs. The guidelines prioritize public safety while enabling technological advancement through a structured regulatory approach that balances innovation with risk management."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the most important information about {title.lower()} from the guidelines.",
-        f"Next, I need to condense this information into its essential components, eliminating redundancy and minor details.",
-        f"Finally, I can craft a concise summary that captures the key points in under 100 words."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "SUMMARIZATION",
-        "difficulty": "EASY",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
 
-def generate_critical_analysis_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a critical analysis question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a critical analysis question that prompts evaluation of the document content. The question should test the reader's ability to critically assess the strengths and weaknesses of the material.
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify potential strengths, weaknesses, assumptions, or limitations.
 2. Create a question that asks for a critical evaluation of specific aspects of the content.
 3. Provide an answer that thoughtfully assesses the strengths and weaknesses of the identified aspects.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "CRITICAL_ANALYSIS",
-  "difficulty": "HARD",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1187,82 +710,33 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating critical analysis QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_critical_analysis_qa_simple(section, section_index)
+        elif question_type == QuestionType.TECHNICAL_EXPLANATION:
+            prompt = f"""
+For the following document section, generate a question asking to explain a complex technical process in layman's terms. The question should test the reader's ability to simplify technical concepts for a non-specialist audience.
 
-def generate_critical_analysis_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a critical analysis question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate a critical analysis question
-    question = f"What are the potential limitations or weaknesses in the {title.lower()} section of the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles? How might these limitations impact implementation?"
-    
-    # Generate an answer based on critical analysis
-    answer = f"The {title.lower()} section of the Pennsylvania guidelines has several potential limitations: 1) It may not fully address rapidly evolving technologies, creating regulatory gaps for new innovations; 2) The requirements could be overly prescriptive in some areas, potentially stifling innovation; 3) There may be insufficient consideration of edge cases or unusual scenarios; 4) The guidelines might create compliance burdens that disproportionately impact smaller companies; and 5) There could be ambiguities in terminology that lead to inconsistent interpretation. These limitations could impact implementation by creating uncertainty for manufacturers, potentially delaying deployment of beneficial technologies, or requiring frequent regulatory updates as the technology evolves."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to critically examine the {title.lower()} section to identify potential gaps, inconsistencies, or problematic assumptions.",
-        f"Next, I need to assess how these limitations might affect different stakeholders and the overall effectiveness of the regulations.",
-        f"Finally, I can evaluate the potential consequences of these limitations for the implementation and evolution of Highly Automated Vehicle technology."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "CRITICAL_ANALYSIS",
-        "difficulty": "HARD",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
 
-def generate_technical_explanation_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a technical explanation question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a question asking to explain a complex technical process in layman's terms. The question should test the reader's ability to simplify technical concepts for a non-specialist audience.
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify complex technical processes, concepts, or terminology.
 2. Create a question that asks for an explanation of this technical content in simple terms.
 3. Provide an answer that explains the concept clearly without jargon, as if teaching it to a high school student.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "TECHNICAL_EXPLANATION",
-  "difficulty": "MEDIUM",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1277,82 +751,33 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating technical explanation QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_technical_explanation_qa_simple(section, section_index)
+        elif question_type == QuestionType.PROCESS_WORKFLOW:
+            prompt = f"""
+For the following document section, generate a question about sequential processes or workflows. The question should test the reader's ability to understand and recall the steps in a process in the correct order.
 
-def generate_technical_explanation_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a technical explanation question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate a technical explanation question
-    question = f"Explain the technical aspects of {title.lower()} for Highly Automated Vehicles in simple terms, as if you were teaching a high school student with no prior knowledge of autonomous vehicle technology."
-    
-    # Generate an answer based on technical explanation
-    answer = f"Think of {title.lower()} for self-driving cars like this: Imagine you're teaching someone to drive. First, you'd explain the rules of the road, show them how the car works, and then watch them practice until they're safe. For self-driving cars, {title.lower()} works similarly. The car's computer system needs to learn all the rules, demonstrate it can follow them correctly, and prove it can handle unexpected situations safely. The Pennsylvania guidelines create a structured way to ensure these computer drivers are properly trained and tested before they're allowed on public roads. They specify what the car needs to know, how it should behave in different situations, and what safety measures must be in place to protect everyone on the road."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the technical concepts related to {title.lower()} in the guidelines.",
-        f"Next, I need to translate these technical concepts into everyday language and relatable analogies.",
-        f"Finally, I can structure an explanation that builds understanding progressively without using specialized terminology."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "TECHNICAL_EXPLANATION",
-        "difficulty": "MEDIUM",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
 
-def generate_process_workflow_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a process/workflow question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate a question about sequential processes or workflows. The question should test the reader's ability to understand and recall the steps in a process in the correct order.
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify any sequential processes, procedures, or workflows.
 2. Create a question that asks about the stages or steps in this process.
 3. Provide an answer that lists the steps in the correct order with phase names.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "PROCESS_WORKFLOW",
-  "difficulty": "EASY",
-  "question": "<text>",
+  "question": "<text>", 
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1367,40 +792,20 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating process workflow QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_process_workflow_qa_simple(section, section_index)
+        elif question_type == QuestionType.TRUE_FALSE_FILL_BLANK:
+            prompt = f"""
+For the following document section, generate either a true/false statement with corrections for false statements, or a fill-in-the-blank question with key terms. The question should test the reader's basic recall and understanding of key facts.
 
-def generate_true_false_fill_blank_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a true/false or fill-in-the-blank question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate either a true/false statement with corrections for false statements, or a fill-in-the-blank question with key terms. The question should test the reader's basic recall and understanding of key facts.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify key facts, definitions, or statements.
@@ -1409,14 +814,13 @@ Follow these steps:
    b. A fill-in-the-blank question where a key term is missing.
 3. Provide the correct answer, including the full corrected statement for false statements.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "TRUE_FALSE_FILL_BLANK",
-  "difficulty": "EASY",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1431,54 +835,33 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
-        
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating true/false or fill-in-the-blank QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_true_false_fill_blank_qa_simple(section, section_index)
+        elif question_type == QuestionType.CONTEXTUAL_AMBIGUITY:
+            prompt = f"""
+For the following document section, generate an ambiguous question where the answer depends on understanding context from multiple parts of the section. The question should test the reader's ability to resolve ambiguities by considering the broader context.
 
-def generate_contextual_ambiguity_qa_with_lmdeploy(pipe, section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a contextual ambiguity resolution question-answer pair using lmdeploy."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Extract the content without the title
-    content = re.sub(r'^#+ .*?$', '', section, count=1, flags=re.MULTILINE).strip()
-    
-    # Prepare the prompt
-    prompt = f"""
-For the following document section about Highly Automated Vehicles (HAV) regulations, generate an ambiguous question where the answer depends on understanding context from multiple parts of the section. The question should test the reader's ability to resolve ambiguities by considering the broader context.
+{metadata_context}
+{common_instructions}
+CONTEXT:
+1. FULL SECTION WHERE FACT APPEARS:
+{section}
+
+2. RELEVANT SECTIONS FROM DOCUMENT:
+{relevant_sections_text}
+
+{image_context}
 
 Follow these steps:
 1. Analyze the content to identify terms, phrases, or references that could be ambiguous without proper context.
 2. Create a question that asks about the meaning or referent of such an ambiguous element.
 3. Provide an answer that explains how the context resolves the ambiguity.
 4. Use markdown format for the answer where appropriate.
+5. Only include images in the response JSON if they are Automated Traffic Signal Performance Measure charts that the question is asking to analyze.
 
 Use the following JSON format:
 
 {{
-  "section_number": "{section_index}",
-  "question_type": "CONTEXTUAL_AMBIGUITY",
-  "difficulty": "HARD",
   "question": "<text>",
+  "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
   "answer": "<text>",
   "reasoning_steps": [
     "<Step 1 description>",
@@ -1493,552 +876,326 @@ Here is the section content:
 
 {content}
 """
-    
-    # Call lmdeploy
-    try:
-        from lmdeploy import GenerationConfig
         
-        # Set up generation config
-        gen_config = GenerationConfig(temperature=args.temperature, max_new_tokens=args.max_tokens)
-        
-        # Generate response
-        response = pipe(prompt, gen_config=gen_config)
-        
-        # Extract the JSON from the response
-        json_str = get_json_str(response.text)
-        qa_pair = json.loads(json_str)
-        
-        return qa_pair
-    
-    except Exception as e:
-        print(f"Error generating contextual ambiguity QA pair with lmdeploy: {e}")
-        # Fallback to simple heuristic method
-        return generate_contextual_ambiguity_qa_simple(section, section_index)
-
-def generate_process_workflow_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a process/workflow question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate a process/workflow question
-    question = f"What are the sequential steps or stages in the {title.lower()} process for Highly Automated Vehicles according to the Pennsylvania Department of Transportation guidelines? List them in order."
-    
-    # Generate an answer based on process/workflow
-    answer = f"The {title.lower()} process for Highly Automated Vehicles consists of the following sequential steps: 1) Initial Assessment - Evaluate the vehicle's capabilities and intended operational domain; 2) Documentation Preparation - Compile all required technical specifications and safety protocols; 3) Submission Phase - Submit materials to regulatory authorities for review; 4) Evaluation Period - Authorities assess compliance with all requirements; 5) Feedback Integration - Address any concerns or requested modifications; 6) Final Approval - Receive authorization to proceed with the next phase; and 7) Ongoing Monitoring - Maintain compliance through regular reporting and updates."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify any sequential processes or workflows described in the {title.lower()} section.",
-        f"Next, I need to organize these steps in their correct chronological or logical order.",
-        f"Finally, I can present these steps with clear phase names and descriptions to show the complete workflow."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "PROCESS_WORKFLOW",
-        "difficulty": "EASY",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
-
-def generate_true_false_fill_blank_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a true/false or fill-in-the-blank question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Randomly choose between true/false or fill-in-the-blank
-    is_true_false = random.choice([True, False])
-    
-    if is_true_false:
-        # Generate a true/false question
-        # Randomly decide if the statement should be true or false
-        is_statement_true = random.choice([True, False])
-        
-        if is_statement_true:
-            question = f"True or False: The Pennsylvania Department of Transportation guidelines require specific {title.lower()} protocols for Highly Automated Vehicles to ensure public safety."
-            answer = f"True. The Pennsylvania Department of Transportation guidelines do require specific {title.lower()} protocols for Highly Automated Vehicles to ensure public safety."
+        # Create the prompt input structure
+        if all_image_paths:
+            prompt_input = {
+                "text": prompt,  # The generated prompt text
+                "images": all_image_paths  # List of image paths
+            }
         else:
-            question = f"True or False: The Pennsylvania Department of Transportation guidelines exempt Highly Automated Vehicles from all {title.lower()} requirements."
-            answer = f"False. Correction: The Pennsylvania Department of Transportation guidelines do NOT exempt Highly Automated Vehicles from {title.lower()} requirements. In fact, they establish specific standards and protocols that must be followed."
-    else:
-        # Generate a fill-in-the-blank question
-        question = f"According to the Pennsylvania Department of Transportation guidelines, the primary purpose of {title.lower()} requirements for Highly Automated Vehicles is to ensure ____________."
-        answer = f"public safety and regulatory compliance"
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify a key fact or concept related to {title.lower()} in the guidelines.",
-        f"Next, I need to formulate this information into a clear statement that can be assessed as true/false or completed with a specific term.",
-        f"Finally, I need to provide the correct answer with appropriate explanation or correction if needed."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "TRUE_FALSE_FILL_BLANK",
-        "difficulty": "EASY",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+            # prompt_input = prompt  # Just text if no images
+            prompt_input = {
+                "text": prompt,  # The generated prompt text
+            }
 
-def generate_contextual_ambiguity_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a contextual ambiguity resolution question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate a contextual ambiguity question
-    question = f"In the {title.lower()} section of the Pennsylvania Department of Transportation guidelines, what does 'the system' refer to in the context of Highly Automated Vehicles? Why might this reference be ambiguous without proper context?"
-    
-    # Generate an answer based on contextual ambiguity
-    answer = f"In the {title.lower()} section, 'the system' refers specifically to the autonomous driving system that controls the vehicle's operations, not to the broader regulatory system or the vehicle's mechanical systems. This reference could be ambiguous because without proper context, 'the system' could potentially refer to: 1) The autonomous driving software; 2) The vehicle's hardware components; 3) The regulatory framework governing HAVs; 4) The testing and certification system; or 5) The emergency response system. The correct interpretation requires understanding the surrounding context, which clarifies that it refers to the autonomous driving system responsible for vehicle navigation and decision-making."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify potentially ambiguous terms or references in the {title.lower()} section.",
-        f"Next, I need to analyze how the surrounding context helps resolve this ambiguity and determine the correct interpretation.",
-        f"Finally, I can explain why this term could be confusing without proper context and how a careful reading of the full section clarifies its meaning."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "CONTEXTUAL_AMBIGUITY",
-        "difficulty": "HARD",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+        if question_type is not QuestionType.FACT_BASED:
+            prompts.append(prompt_input)
+            if question_type is not QuestionType.SECTION_SUMMARY:
+                metadata.append({
+                    "section_idx": section_idx,
+                    "question_type": question_type.name,
+                    "difficulty": QUESTION_TYPE_DIFFICULTY[question_type].value
+                })
+            else:
+                metadata.append({
+                    "section_idx": section_idx,
+                    "question_type": question_type.name,
+                    "difficulty": QUESTION_TYPE_DIFFICULTY[question_type].value,
+                    "is_summary": True
+                })
+        
+    logger.info(f"Prompts to run: {len(prompts)}")
 
-def generate_application_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate an application/practical use question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
+    # Call API for prompts 
+    responses = call_lmdeploy_api(pipe, prompts)
     
-    # Generate an application question
-    question = f"A company is developing a new Highly Automated Vehicle and needs to comply with the {title.lower()} requirements in Pennsylvania. What specific steps should they follow according to the guidelines?"
-    
-    # Generate an answer based on application
-    answer = f"To comply with the {title.lower()} requirements in Pennsylvania, the company should follow these steps: 1) Review the specific criteria outlined in the guidelines; 2) Develop internal processes that ensure all aspects of {title.lower()} are addressed; 3) Document how their vehicle design meets each requirement; 4) Implement testing procedures to verify compliance; 5) Prepare all necessary documentation for submission to regulatory authorities; 6) Submit the required materials through the designated channels; 7) Address any feedback or requests for additional information; and 8) Maintain ongoing compliance through regular monitoring and updates."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the practical requirements related to {title.lower()} in the guidelines.",
-        f"Next, I need to translate these regulatory requirements into actionable steps a company could follow.",
-        f"Finally, I can organize these steps into a logical sequence that would ensure compliance with the {title.lower()} requirements."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "APPLICATION",
-        "difficulty": "MEDIUM",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+    # Process responses
+    qa_pairs = []
+    current_section_facts = []  # Track all facts from current section
+    current_section_meta = None  # Track metadata for current section
+    current_section_failed = False  # Flag if current section has failures
 
-def generate_comparative_analysis_qa_simple(sections: List[str], section_index: int) -> Dict[str, Any]:
-    """Generate a comparative analysis question-answer pair using simple heuristics."""
-    # Need at least two sections for comparative analysis
-    if len(sections) < 2:
-        return None
-    
-    # Select two random sections
-    section1, section2 = random.sample(sections, 2)
-    
-    # Extract the section titles if they exist
-    title_match1 = re.match(r'^#+ (.*?)$', section1, re.MULTILINE)
-    title1 = title_match1.group(1).strip() if title_match1 else "Section A"
-    
-    title_match2 = re.match(r'^#+ (.*?)$', section2, re.MULTILINE)
-    title2 = title_match2.group(1).strip() if title_match2 else "Section B"
-    
-    # Generate a comparative analysis question
-    question = f"Compare and contrast the requirements for {title1.lower()} and {title2.lower()} as outlined in the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles. What are the key similarities and differences?"
-    
-    # Generate an answer based on comparative analysis
-    answer = f"When comparing {title1.lower()} and {title2.lower()}, several key similarities and differences emerge. Similarities include: both require detailed documentation, both are subject to regulatory oversight, and both contribute to overall vehicle safety. Key differences include: {title1.lower()} focuses more on technical specifications while {title2.lower()} emphasizes procedural requirements; {title1.lower()} has more quantitative standards, whereas {title2.lower()} involves more qualitative assessments; and the verification processes for each have different timelines and responsible parties."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the key characteristics and requirements for both {title1.lower()} and {title2.lower()}.",
-        f"Next, I need to systematically analyze which aspects are shared between them and which are distinct.",
-        f"Finally, I can organize these observations into a structured comparison highlighting both similarities and differences."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "COMPARATIVE_ANALYSIS",
-        "difficulty": "MEDIUM",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+    for response, meta in zip(responses, metadata):
+        try:
+            # Skip processing facts if we've already failed this section
+            if current_section_failed and meta.get('question_type') == 'FACT_BASED' and meta['section_idx'] == current_section_meta['section_idx']:
+                continue
 
-def generate_cause_effect_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a cause-effect relationship question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate a cause-effect question
-    question = f"According to the Pennsylvania Department of Transportation guidelines, what consequences or effects result from non-compliance with the {title.lower()} requirements for Highly Automated Vehicles?"
-    
-    # Generate an answer based on cause-effect
-    answer = f"Non-compliance with the {title.lower()} requirements leads to several consequences: 1) Potential denial or revocation of operating permits; 2) Mandatory cessation of vehicle testing or deployment; 3) Financial penalties as prescribed by regulatory authorities; 4) Increased scrutiny and more frequent inspections for future operations; and 5) Possible legal liability in the event of accidents or incidents related to the non-compliance."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the causal relationships described in the section on {title.lower()}.",
-        f"Next, I need to trace the chain of effects that result from specific actions or conditions related to {title.lower()}.",
-        f"Finally, I can articulate the complete cause-effect relationship, showing how one event or condition leads to specific outcomes."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "CAUSE_EFFECT",
-        "difficulty": "MEDIUM",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+            # For FACT_BASED questions, collect all facts from a section before adding
+            if meta.get('question_type') == 'FACT_BASED':
+                # If new section, reset tracking
+                if current_section_meta is None or meta['section_idx'] != current_section_meta['section_idx']:
+                    # If we have pending facts from previous section, add them
+                    if current_section_facts:
+                        qa_pairs.extend(current_section_facts)
+                    current_section_facts = []
+                    current_section_meta = meta
+                    current_section_failed = False
 
-def generate_inference_qa_simple(section: str, section_index: int) -> Dict[str, Any]:
-    """Generate an inference question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Generate an inference question
-    question = f"Based on the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles, what can be inferred about the importance of {title.lower()} in ensuring public safety?"
-    
-    # Generate an answer based on inference
-    answer = f"While not explicitly stated, we can infer from the guidelines that {title.lower()} plays a critical role in ensuring public safety because the detailed requirements and procedures outlined suggest that proper implementation is essential for preventing accidents and protecting road users. The emphasis placed on documentation, verification, and compliance indicates that regulators consider {title.lower()} to be a fundamental component of the safety framework for autonomous vehicles. Furthermore, the specific standards established imply that inadequate attention to {title.lower()} could potentially compromise the vehicle's ability to operate safely in various conditions and scenarios."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to analyze what the guidelines imply about {title.lower()} beyond what is explicitly stated.",
-        f"By examining the level of detail and emphasis placed on {title.lower()}, I can draw logical conclusions about its importance.",
-        f"I can then articulate these inferences to show the implicit significance of {title.lower()} in the context of public safety."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "INFERENCE",
-        "difficulty": "MEDIUM",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+                qa_pair = response
+                json_str = get_json_str(response.text)
+                qa_pair = json.loads(json_str)
+                qa_pair.update(meta)
+                current_section_facts.append(qa_pair)
+                
+                logger.info(f"Successfully parsed fact {meta['fact_number']} for section {meta['section_idx']}.")
+            else:
+                # Handle non-FACT_BASED questions normally
+                qa_pair = response
+                json_str = get_json_str(response.text)
+                qa_pair = json.loads(json_str)
+                qa_pair.update(meta)
+                qa_pairs.append(qa_pair)
+                
+                logger.info(f"Successfully parsed response.")
+        
+        except Exception as e:
+            logger.error(f"Error processing response for section {meta['section_idx']}: {e}")
+            # For FACT_BASED, mark section as failed and discard collected facts
+            if meta.get('question_type') == 'FACT_BASED':
+                current_section_facts = []
+                current_section_failed = True
+                logger.warning(f"Section {meta['section_idx']} marked as failed - skipping remaining facts.")
+            
 
-def generate_factual_recall_qa_simple(facts: List[str], section: str, section_index: int) -> Dict[str, Any]:
-    """Generate a factual recall question-answer pair using simple heuristics."""
-    # Extract the section title if it exists
-    title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else "Section"
-    
-    # Select a random fact from the section
-    fact = random.choice(facts) if facts else ""
-    
-    # Generate a factual recall question
-    question = f"According to the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles, what specific information is provided about {title.lower()}?"
-    
-    # Generate an answer based on the fact
-    answer = f"The guidelines explicitly state: \"{fact}\""
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to identify the specific factual information provided in the section about {title.lower()}.",
-        f"The document contains explicit statements about {title.lower()} that can be directly quoted.",
-        f"I can provide the exact text from the document that answers this factual question."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "FACTUAL_RECALL",
-        "difficulty": "EASY",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+            failed_sections.append({
+                'section_idx': meta['section_idx'],
+                'content': section,
+                'question_type': meta.get('question_type', 'unknown'),
+                'error': str(e)
+            })
 
-def generate_multi_hop_qa_simple(sections: List[str], section_index: int) -> Dict[str, Any]:
-    """Generate a multi-hop reasoning question-answer pair using simple heuristics."""
-    # Need at least two sections for multi-hop reasoning
-    if len(sections) < 2:
-        return None
+            logger.debug(response.text)
     
-    # Select two random sections
-    section1, section2 = random.sample(sections, 2)
+    # Add any remaining facts from the last section if they all succeeded
+    if current_section_facts:
+        qa_pairs.extend(current_section_facts)
     
-    # Extract the section titles if they exist
-    title_match1 = re.match(r'^#+ (.*?)$', section1, re.MULTILINE)
-    title1 = title_match1.group(1).strip() if title_match1 else "Section A"
-    
-    title_match2 = re.match(r'^#+ (.*?)$', section2, re.MULTILINE)
-    title2 = title_match2.group(1).strip() if title_match2 else "Section B"
-    
-    # Generate a multi-hop reasoning question
-    question = f"How do the requirements for {title1.lower()} influence or relate to the procedures outlined for {title2.lower()} in the Pennsylvania Department of Transportation guidelines for Highly Automated Vehicles?"
-    
-    # Generate an answer based on multi-hop reasoning
-    answer = f"The requirements for {title1.lower()} directly influence the procedures for {title2.lower()} in several ways. First, the guidelines establish that {title1.lower()} sets foundational standards that must be met before {title2.lower()} can be properly implemented. Additionally, the documentation requirements for {title1.lower()} provide essential information needed for the verification processes described in the {title2.lower()} section. Furthermore, compliance with {title1.lower()} standards is a prerequisite for advancing through the stages outlined in the {title2.lower()} procedures. This interconnection demonstrates how the regulatory framework creates a cohesive approach to ensuring that Highly Automated Vehicles meet all necessary safety and operational requirements."
-    
-    # Generate reasoning steps
-    reasoning_steps = [
-        f"First, I need to understand the key points from both the {title1.lower()} and {title2.lower()} sections of the guidelines.",
-        f"Next, I need to identify the connections and relationships between these two different aspects of Highly Automated Vehicles regulation.",
-        f"Finally, I can explain how information from both sections must be combined to fully understand the regulatory framework."
-    ]
-    
-    return {
-        "section_number": str(section_index),
-        "question_type": "MULTI_HOP_REASONING",
-        "difficulty": "HARD",
-        "question": question,
-        "answer": answer,
-        "reasoning_steps": reasoning_steps
-    }
+    return qa_pairs
 
-def output_to_phi_format(data: List[Dict[str, Any]]) -> Tuple[List[List[Dict[str, str]]], List[List[Dict[str, str]]], List[List[Dict[str, str]]], List[List[Dict[str, str]]]]:
+def retry_failed_sections(pipe, failed_sections, all_sections, metadata, document_name=""):
+    """Retry processing for sections that previously failed"""
+
+    logger.info("Retrying failed sections...")
+
+    retry_results = []  # Store successful retries
+
+    for section in failed_sections:
+        try:
+            logger.info(f"Retrying section {section['section_idx']} (question type: {section['question_type']})")
+
+            # Remove the failed sections, they'll be readded in the generate_qa_pairs_bulk if they fail again
+            failed_sections.remove(section)
+
+            # Generate QA pairs for this retry
+            qa_pairs = generate_qa_pairs_bulk(
+                pipe,
+                [section['content']],
+                [section['section_idx']], 
+                QuestionType[section['question_type']], 
+                all_sections,
+                metadata,
+                document_name
+            )
+
+            if qa_pairs:
+                logger.debug("Adding result to the retry results")
+                retry_results.extend(qa_pairs)
+
+        except Exception as e:
+            logger.error(f"Failed again on section {section['section_idx']}: {e}")
+
+    return retry_results  # Return the successfully processed QA pairs
+
+
+def output_to_phi_format(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Converts JSON data to different formats for different levels of Chain of Thought (CoT) reasoning steps.
     """
-    no_cot, cot_one_step, cot_two_steps, cot_all_steps = [], [], [], []
+    formatted_data = []
 
     for item in data:
         question = item['question']
+        question_images = item.get('question_images', [])
         answer = item['answer']
         reasoning_steps = item['reasoning_steps']
+        question_type = item.get('question_type', 'UNKNOWN')
+        difficulty = item.get('difficulty', 'UNKNOWN')
 
-        response_no_cot = [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer}
-        ]
+        # Build reasoning content if steps exist
+        reasoning_content = ""
+        if reasoning_steps:
 
-        response_cot_one_step = [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": f'{reasoning_steps[0]}\n{answer}'}
-        ]
+            # If the steps are in a list of dicts, convert to string
+            step_strings = []
+            for step in reasoning_steps:
+                if isinstance(step, dict):
+                    # Convert dict to "key: value" pairs
+                    step_str = "\n".join(f"{k}: {v}" for k, v in step.items())
+                else:
+                    step_str = str(step)
+                step_strings.append(step_str)
+            
+            reasoning_content = f"<think>\n{'\\n\\n'.join(step_strings)}\n</think>\n"
 
-        response_cot_two_steps = [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": f'{reasoning_steps[0]} {reasoning_steps[1]}\n{answer}'}
-        ]
+        # Build user content with text and optional images
+        user_content = [{"type": "text", "text": question}]
+        if question_images:
+            for img in question_images:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": img,
+                        "detail": "auto"
+                    }
+                })
 
-        response_cot_all_steps = [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": f'{reasoning_steps[0]} {reasoning_steps[1]} {reasoning_steps[2]}\n{answer}'}
-        ]
+        response = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_content
+                },
+                {
+                    "role": "assistant",
+                    "content": f"{reasoning_content}{answer}"
+                }
+            ],
+            "question_type": question_type,
+            "difficulty": difficulty
+        }
 
-        no_cot.append(response_no_cot)
-        cot_one_step.append(response_cot_one_step)
-        cot_two_steps.append(response_cot_two_steps)
-        cot_all_steps.append(response_cot_all_steps)
+        formatted_data.append(response)
 
-    return no_cot, cot_one_step, cot_two_steps, cot_all_steps
-
-def generate_question_for_section(pipe, question_type: QuestionType, section: str, sections: List[str], section_index: int, facts: List[str]) -> Optional[Dict[str, Any]]:
-    """Generate a question of the specified type for the given section."""
-    try:
-        if question_type == QuestionType.FACTUAL_RECALL:
-            if args.no_llm:
-                return generate_factual_recall_qa_simple(facts, section, section_index)
-            else:
-                return generate_factual_recall_qa_with_lmdeploy(pipe, facts, section, section_index)
-        elif question_type == QuestionType.INFERENCE:
-            if args.no_llm:
-                return generate_inference_qa_simple(section, section_index)
-            else:
-                return generate_inference_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.MULTI_HOP_REASONING:
-            if args.no_llm:
-                return generate_multi_hop_qa_simple(sections, section_index)
-            else:
-                return generate_multi_hop_qa_with_lmdeploy(pipe, sections, section_index)
-        elif question_type == QuestionType.APPLICATION:
-            if args.no_llm:
-                return generate_application_qa_simple(section, section_index)
-            else:
-                return generate_application_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.COMPARATIVE_ANALYSIS:
-            if args.no_llm:
-                return generate_comparative_analysis_qa_simple(sections, section_index)
-            else:
-                return generate_comparative_analysis_qa_with_lmdeploy(pipe, sections, section_index)
-        elif question_type == QuestionType.CAUSE_EFFECT:
-            if args.no_llm:
-                return generate_cause_effect_qa_simple(section, section_index)
-            else:
-                return generate_cause_effect_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.SUMMARIZATION:
-            if args.no_llm:
-                return generate_summarization_qa_simple(section, section_index)
-            else:
-                return generate_summarization_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.HYPOTHETICAL:
-            if args.no_llm:
-                return generate_hypothetical_qa_simple(section, section_index)
-            else:
-                return generate_hypothetical_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.CRITICAL_ANALYSIS:
-            if args.no_llm:
-                return generate_critical_analysis_qa_simple(section, section_index)
-            else:
-                return generate_critical_analysis_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.TECHNICAL_EXPLANATION:
-            if args.no_llm:
-                return generate_technical_explanation_qa_simple(section, section_index)
-            else:
-                return generate_technical_explanation_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.PROCESS_WORKFLOW:
-            if args.no_llm:
-                return generate_process_workflow_qa_simple(section, section_index)
-            else:
-                return generate_process_workflow_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.TRUE_FALSE_FILL_BLANK:
-            if args.no_llm:
-                return generate_true_false_fill_blank_qa_simple(section, section_index)
-            else:
-                return generate_true_false_fill_blank_qa_with_lmdeploy(pipe, section, section_index)
-        elif question_type == QuestionType.CONTEXTUAL_AMBIGUITY:
-            if args.no_llm:
-                return generate_contextual_ambiguity_qa_simple(section, section_index)
-            else:
-                return generate_contextual_ambiguity_qa_with_lmdeploy(pipe, section, section_index)
-        else:
-            print(f"Unsupported question type: {question_type}")
-            return None
-    except Exception as e:
-        print(f"Error generating question of type {question_type}: {e}")
-        return None
+    return formatted_data
 
 def main():
+    # Add argument parsing
+    parser = argparse.ArgumentParser(description='Generate synthetic training data or check image URLs')
+    parser.add_argument('--check_urls', action='store_true', 
+                       help='Check image URLs in JSON files')
+    parser.add_argument('--file', type=str, default='',
+                       help='Specific file to check (optional)')
+    args = parser.parse_args()
+
+    if args.check_urls:
+        if args.file:
+            # Check single file
+            check_image_urls_in_file(args.file)
+        else:
+            # Check all files in output directory
+            check_all_output_files(OUTPUT_DIR)
+        return
+    
     # Set up lmdeploy pipeline if using LLM
     pipe = None
-    if not args.no_llm:
-        pipe = setup_lmdeploy_pipeline()
-        if pipe is None:
-            print("Failed to set up lmdeploy pipeline. Falling back to simple heuristics.")
-            args.no_llm = True
+
+    pipe = setup_lmdeploy_pipeline(MODEL, NUM_GPUS, MODEL_FORMAT)
+    if pipe is None:
+        logger.error("Failed to set up lmdeploy pipeline - exiting.")
+        sys.exit(1)
     
-    # Lists to store QA pairs
-    fact_qa_pairs = []  # Original fact-based QA pairs
-    summary_qa_pairs = []  # Original summary QA pairs
-    new_qa_pairs = []  # New question types
-    
-    # Process each markdown file in the directory
+    # Check to make sure all the images in each markdown file are valid so we can check for errors before continuing
     for filename in os.listdir(MARKDOWN_DOCS_DIR):
         if filename.endswith('.md'):
             file_path = os.path.join(MARKDOWN_DOCS_DIR, filename)
-            print(f"Processing {file_path}...")
+            
+            document_name = get_document_name_from_filename(filename)
+            logger.info(f"Checking images in {document_name}...")
             
             # Read the markdown content
-            content = read_markdown_file(file_path)
+            metadata, content = read_markdown_file(file_path)
+            image_refs = extract_image_references(content)
+            image_paths = resolve_image_paths(image_refs, document_name)
+
+    # Process each markdown file in the directory
+    for filename in os.listdir(MARKDOWN_DOCS_DIR):
+        try:
+            # Lists to store QA pairs, reset for each document
+            new_qa_pairs = []  # New question types
             
-            # Split into sections
-            sections = split_into_sections(content)
-            
-            # Process each section
-            for section_idx, section in enumerate(sections):
-                section_idx += 1  # 1-based indexing for section numbers
-                print(f"  Processing section {section_idx}/{len(sections)}...")
+            if filename.endswith('.md'):
+                file_path = os.path.join(MARKDOWN_DOCS_DIR, filename)
+                logger.info(f"Processing {file_path}...")
                 
-                # Extract facts from the section
-                facts = extract_facts_from_section(section)
-                print(f"    Found {len(facts)} facts in section {section_idx}")
+                # Read the markdown content
+                metadata, content = read_markdown_file(file_path)
                 
-                # Generate original fact-based QA pairs
-                for fact_idx, fact in enumerate(facts):
-                    fact_idx += 1  # 1-based indexing for fact numbers
-                    print(f"    Generating fact-based QA pair for fact {fact_idx}/{len(facts)} in section {section_idx}...")
+                # Extract document name for image folder check
+                document_name = get_document_name_from_filename(filename)
+                logger.debug(f"Document name for image check: {document_name}")
+                
+                # Split into sections
+                sections = split_into_sections(content)
+
+                # Process sections in bulk
+                batch_size = 100  # Adjust based on your API rate limits
+                
+                for question_type in QuestionType:
+
+                    logger.info(f"Generating {question_type.name} questions in bulk...")
                     
-                    if args.no_llm:
-                        qa_pair = generate_fact_qa_pair_simple(fact, section_idx, fact_idx)
+                    # Prepare batches
+                    for i in range(0, len(sections), batch_size):
+                        batch_sections = sections[i:i+batch_size]
+                        batch_indices = list(range(i+1, i+len(batch_sections)+1))  # 1-based
+                        
+                        qa_pairs = generate_qa_pairs_bulk(
+                            pipe,
+                            batch_sections,
+                            batch_indices,
+                            question_type,
+                            sections,
+                            metadata,
+                            document_name
+                        )
+
+                        # Call this at the end of your main processing
+                        max_retries = MAX_RETRIES
+                        retry_count = 0
+                        while len(failed_sections) > 0 and retry_count < max_retries:
+                            logger.info(f"\nRetry attempt {retry_count + 1}/{max_retries} for {len(failed_sections)} failed sections...")
+                            retry_results = retry_failed_sections(pipe, failed_sections, sections, metadata, document_name)
+                            qa_pairs.extend(retry_results)
+                            retry_count += 1
+                        
+                        # Log any remaining failures after max retries
+                        if len(failed_sections) > 0:
+                            logger.warning(f"{len(failed_sections)} sections failed after {max_retries} retries")
+                        
+                        # Add to results
+                        new_qa_pairs.extend(qa_pairs)
+        
+                # Convert QA pairs to JSON format
+                logger.info("Converting all QA pairs to JSON format for training...")
+                all_responses = output_to_phi_format(new_qa_pairs)
+                
+                # Prepare training and validation data
+                train_data = []
+                eval_data = []
+
+                # Separate summary QA pairs for evaluation and others for training
+                for qa_pair in all_responses:
+                    if qa_pair['question_type'] == "SECTION_SUMMARY":
+                        eval_data.append(qa_pair)
                     else:
-                        qa_pair = generate_fact_qa_pair_with_lmdeploy(pipe, fact, section_idx, fact_idx)
-                        # Add a small delay to avoid rate limiting
-                        time.sleep(1)
-                    
-                    fact_qa_pairs.append(qa_pair)
+                        train_data.append(qa_pair)
                 
-                # Generate original summary QA pair
-                print(f"    Generating summary QA pair for section {section_idx}...")
-                if args.no_llm:
-                    summary_qa_pair = generate_section_summary_qa_pair_simple(section, section_idx)
-                else:
-                    summary_qa_pair = generate_section_summary_qa_pair_with_lmdeploy(pipe, section, section_idx)
-                    # Add a small delay to avoid rate limiting
-                    time.sleep(1)
+                # Save the output
+                train_file = save_output_to_file(train_data, OUTPUT_DIR, f'train-{document_name}')
+                eval_file = save_output_to_file(eval_data, OUTPUT_DIR, f'eval-{document_name}')
                 
-                summary_qa_pairs.append(summary_qa_pair)
-                
-                # Generate new question types
-                # Determine how many questions of each type to generate for this section
-                # total_new_questions = min(len(facts), 10)  # Cap at 10 new questions per section
-                total_new_questions = len(facts) # Use the number of facts as the number of new questions to generate
-                
-                # Calculate the number of questions for each type based on distribution
-                question_counts = {}
-                for q_type, percentage in QUESTION_TYPE_DISTRIBUTION.items():
-                    count = max(1, int(total_new_questions * percentage / 100))
-                    question_counts[q_type] = count
-                
-                # Generate questions for each type
-                for q_type, count in question_counts.items():
-                    for i in range(count):
-                        print(f"    Generating {q_type.name} question {i+1}/{count} for section {section_idx}...")
-                        qa_pair = generate_question_for_section(pipe, q_type, section, sections, section_idx, facts)
-                        if qa_pair:
-                            new_qa_pairs.append(qa_pair)
-                            # Add a small delay to avoid rate limiting
-                            if not args.no_llm:
-                                time.sleep(1)
-    
-    print(f"Generated {len(fact_qa_pairs)} fact QA pairs")
-    print(f"Generated {len(summary_qa_pairs)} summary QA pairs")
-    print(f"Generated {len(new_qa_pairs)} new question type QA pairs")
-    
-    # Combine all QA pairs
-    all_qa_pairs = fact_qa_pairs + new_qa_pairs
-    
-    # Convert to different CoT formats
-    print("Converting all QA pairs to different CoT formats for training...")
-    all_responses = output_to_phi_format(all_qa_pairs)
-    
-    print("Converting summary QA pairs to different CoT formats for validation...")
-    summary_responses = output_to_phi_format(summary_qa_pairs)
-    
-    # Prepare training and validation data
-    train_data = []
-    eval_data = []
-    
-    # Add all QA pairs to training data
-    for i in range(4):  # For each CoT format
-        train_data.extend(all_responses[i])
-    
-    # Add all summary QA pairs to validation data
-    for i in range(4):  # For each CoT format
-        eval_data.extend(summary_responses[i])
-    
-    # Get current timestamp for filenames
-    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    
-    # Save the training data
-    train_file = os.path.join(OUTPUT_DIR, f'train-synthetic-data-{timestamp}.json')
-    with open(train_file, "w") as f:
-        json.dump(train_data, f, indent=2)
-    
-    # Save the evaluation data
-    eval_file = os.path.join(OUTPUT_DIR, f'validation-synthetic-data-{timestamp}.json')
-    with open(eval_file, "w") as f:
-        json.dump(eval_data, f, indent=2)
-    
-    print(f"Saved {len(train_data)} training examples to {train_file}")
-    print(f"Saved {len(eval_data)} validation examples to {eval_file}")
+                logger.info(f"Saved {len(train_data)} training examples to {train_file}")
+                logger.info(f"Saved {len(eval_data)} validation examples to {eval_file}")
+            
+        except MemoryError:
+            logger.error(f"Memory error processing {filename}, skipping to next file")
+            continue
+        except Exception as e:
+            logger.error(f"Unexpected error processing {filename}: {str(e)}")
+            continue
+
 
 if __name__ == "__main__":
     main()
