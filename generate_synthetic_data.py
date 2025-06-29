@@ -23,6 +23,7 @@ from utilities.file_utils import *
 from models.question_types import QuestionType, QUESTION_TYPE_DIFFICULTY
 import argparse 
 from utilities.check_image_urls import check_image_urls_in_file, check_all_output_files
+
 # Load environment variables
 load_dotenv()
 

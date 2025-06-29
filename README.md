@@ -85,8 +85,13 @@ cd SyntheticDataGeneration
 
 2. **Install dependencies**
 ```bash
-pip install -r requirements.txt
-# or install individually as listed above
+pip install lmdeploy[all]
+pip install nest_asyncio
+pip install scikit-learn
+pip install python-dotenv
+pip install colorama
+pip install pyyaml
+pip install timm
 ```
 
 3. **Configure environment variables**
