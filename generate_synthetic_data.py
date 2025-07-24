@@ -179,18 +179,38 @@ def generate_qa_pairs_bulk(pipe, sections: List[str], section_indices: List[int]
         common_instructions = f"""
 ADDITIONAL INSTRUCTIONS:
 1. Always refer to the document in third person as "{doc_title}" (e.g., "According to {doc_title}" instead of "According to the document")
-2. Never use first-person references like "I", "we", or "our document"
-3. Maintain an objective, third-person perspective throughout
-4. Do not refer to figures or tables directly. Only use the information in the exhibit to provide information for the questions and answers. Any time an exhibit is referred to in an answer, the document name should be included so a user knows where to look.
-5. Images should only be added to the final JSON if they are example ATSPM charts to be interpereted by the answer. Images should refer to real files.
+2. Never use first-person references like "I", "we", or "our document" - maintain objective third-person perspective
+3. For visual references:
+   - Only include images if they are ATSPM charts requiring interpretation
+   - Ensure image paths reference real files in the system
+   - When mentioning exhibits, specify the document name (e.g., "As shown in {doc_title}'s Figure 3...")
+4. Answer requirements:
+   - Must be complete and self-contained
+   - Should not require external context beyond what's provided
+   - Use markdown formatting where appropriate (lists, bold, etc.)
+5. Question requirements:
+   - Should be clear and unambiguous
+   - Must be answerable using only the provided content
+   - Should test specific knowledge or reasoning skills
+6. Style guidelines:
+   - Match the document's technical level and tone
+   - Avoid colloquial language
+   - Use consistent terminology from the source material
+7. For multi-part answers:
+   - Structure logically with clear steps
+   - Number sequential processes
+   - Highlight key conclusions
 """
         
         # Create prompt based on question type
         if question_type == QuestionType.FACT_BASED:
 
+            logger.debug(f"FACTS: {facts}")
+
             for fact_idx, fact in enumerate(facts):
 
                 logger.debug(f"Creating prompt for fact {fact_idx} for section {section_idx}...")
+                logger.debug(f"FACT: {fact}")
 
                 relevant_sections_text_for_fact = get_closest_sections_text(fact, all_sections, section_idx, document_name=document_name)
             
@@ -232,7 +252,19 @@ Use this JSON format:
 }}
 """
                 
-                prompts.append(prompt)
+                # Create the prompt input structure
+                if all_image_paths:
+                    prompt_input = {
+                        "text": prompt,  # The generated prompt text
+                        "images": all_image_paths  # List of image paths
+                    }
+                else:
+                    # prompt_input = prompt  # Just text if no images
+                    prompt_input = {
+                        "text": prompt,  # The generated prompt text
+                    }
+
+                prompts.append(prompt_input)
                 metadata.append({
                     "section_idx": section_idx,
                     "fact_number": fact_idx,
@@ -878,19 +910,21 @@ Here is the section content:
 {content}
 """
         
-        # Create the prompt input structure
-        if all_image_paths:
-            prompt_input = {
-                "text": prompt,  # The generated prompt text
-                "images": all_image_paths  # List of image paths
-            }
-        else:
-            # prompt_input = prompt  # Just text if no images
-            prompt_input = {
-                "text": prompt,  # The generated prompt text
-            }
 
         if question_type is not QuestionType.FACT_BASED:
+            
+            # Create the prompt input structure
+            if all_image_paths:
+                prompt_input = {
+                    "text": prompt,  # The generated prompt text
+                    "images": all_image_paths  # List of image paths
+                }
+            else:
+                # prompt_input = prompt  # Just text if no images
+                prompt_input = {
+                    "text": prompt,  # The generated prompt text
+                }
+
             prompts.append(prompt_input)
             if question_type is not QuestionType.SECTION_SUMMARY:
                 metadata.append({
