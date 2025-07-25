@@ -2,7 +2,7 @@
 
 Synthetic Training Data Generator for LLM Fine-tuning
 
-This script processes markdown files and generates synthetic question-answer pairs with reasoning steps,
+This script processes markdown files and generates synthetic question-answer pairs,
 formatted for training Large Language Models (LLMs). It uses lmdeploy with InternVL3-8B model to generate
 QA pairs with different difficulty levels.
 
@@ -243,12 +243,7 @@ Use this JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1: How context informs the question>",
-    "<Step 2: Key elements from fact>", 
-    "<Step 3: How to formulate answer>"
-  ]
+  "answer": "<text>"
 }}
 """
                 
@@ -297,12 +292,7 @@ Ensure all outputs are independent of the original text context. The question an
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section:
@@ -341,12 +331,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -386,12 +371,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -454,12 +434,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here are the sections:
@@ -497,12 +472,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -563,12 +533,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here are the sections:
@@ -606,12 +571,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -647,12 +607,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -688,12 +643,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -729,12 +679,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -770,12 +715,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -811,12 +751,7 @@ Use the following JSON format:
 {{
   "question": "<text>", 
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -854,12 +789,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -895,12 +825,7 @@ Use the following JSON format:
 {{
   "question": "<text>",
   "question_images": ['<folder/image1.jpg>', '<folder/image2.jpg>']
-  "answer": "<text>",
-  "reasoning_steps": [
-    "<Step 1 description>",
-    "<Step 2 description>",
-    "<Step 3 description>"
-  ]
+  "answer": "<text>"
 }}
 
 Here is the section content:
@@ -1046,11 +971,13 @@ def retry_failed_sections(pipe, failed_sections, all_sections, metadata, documen
 
 def output_to_phi_format(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Converts JSON data to different formats for different levels of Chain of Thought (CoT) reasoning steps.
+    Converts received JSON to final JSON output format.
     """
     formatted_data = []
 
     for item in data:
+        logger.debug(f"ITEM: {item}")
+
         question = item['question']
         question_images = item.get('question_images', [])
         answer = item['answer']
@@ -1100,6 +1027,9 @@ def output_to_phi_format(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "question_type": question_type,
             "difficulty": difficulty
         }
+
+        # TODO: FOR DEBUGGING
+        logger.debug(f"RESPONSE: {response}")
 
         formatted_data.append(response)
 
@@ -1168,6 +1098,10 @@ def main():
                 batch_size = 100  # Adjust based on your API rate limits
                 
                 for question_type in QuestionType:
+
+                    # TODO: FOR DEBUGGING
+                    if(question_type != QuestionType.MULTI_HOP_REASONING):
+                        continue
 
                     logger.info(f"Generating {question_type.name} questions in bulk...")
                     

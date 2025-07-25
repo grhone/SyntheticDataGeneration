@@ -225,7 +225,7 @@ Each file contains question-answer pairs in this multi-modal format:
    - Tracks and reports processing statistics
 
 5. **Output Generation**
-   - Converts to training-ready format with reasoning steps
+   - Converts to training-ready format
    - Separates training and evaluation datasets
    - Adds metadata tags for question types and difficulty
 
@@ -262,7 +262,6 @@ Each file contains question-answer pairs in this multi-modal format:
 
 ### Output Format Changes
 - Modify `output_to_phi_format()` for different training frameworks
-- Adjust reasoning step formatting in the conversion pipeline
 
 ## Example Output
 
@@ -271,7 +270,7 @@ For a document about traffic signal timing, the system generates questions like:
 **Multi-Modal Technical Question:**
 - **Question**: "Analyze the ATSPM chart shown and explain what the split failure pattern indicates about signal timing efficiency."
 - **Images**: `traffic_manual/FIGURE_5.2.png`
-- **Answer**: Detailed analysis with step-by-step reasoning
+- **Answer**: Detailed technical analysis analysis 
 
 **Multi-Hop Reasoning:**
 - **Question**: "How do the pedestrian clearance requirements in Section 3 relate to the vehicle detection standards in Section 7?"
