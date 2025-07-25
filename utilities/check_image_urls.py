@@ -57,6 +57,22 @@ init(autoreset=True)
 logger = setup_logger(__name__)
 
 def validate_image_urls(json_data):
+    """Validates image URLs in JSON chat message data.
+    
+    Args:
+        json_data: List of message dictionaries containing image references
+        
+    Returns:
+        List of dictionaries with structure:
+        {
+            "image_url": str,  # Invalid path
+            "context": str     # First 100 chars of assistant response
+        }
+        
+    Raises:
+        KeyError: If JSON structure doesn't match expected format
+    """
+    
     invalid_images = []
     
     for item in json_data:
@@ -73,7 +89,23 @@ def validate_image_urls(json_data):
     return invalid_images
 
 def check_image_urls_in_file(file_path: str):
-    """Check image URLs in a JSON file and report invalid ones"""
+    """Validates image URLs in a single JSON file.
+    
+    Args:
+        file_path: Path to JSON file containing chat messages
+        
+    Returns:
+        bool: True if all image paths are valid, False otherwise
+        
+    Prints:
+        - Validation results to console
+        - Error messages if file cannot be read
+        
+    Example:
+        >>> check_image_urls_in_file("data/conversations.json")
+        Found 3 invalid image paths...
+    """
+
     try:
         with open(file_path, "r") as f:
             data = json.load(f)
@@ -94,7 +126,19 @@ def check_image_urls_in_file(file_path: str):
         return False
 
 def check_all_output_files(output_dir: str):
-    """Check image URLs in all JSON files in output directory"""
+    """Batch validates image URLs in all JSON files within a directory.
+    
+    Args:
+        output_dir: Directory containing JSON files to validate
+        
+    Returns:
+        bool: True if all files contain valid image paths, False otherwise
+        
+    Notes:
+        - Only checks files with .json extension
+        - Processes files sequentially
+    """
+    
     all_valid = True
     for filename in os.listdir(output_dir):
         if filename.endswith('.json'):

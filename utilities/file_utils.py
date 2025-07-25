@@ -9,7 +9,21 @@ import json
 logger = setup_logger(__name__)
 
 def read_markdown_file(file_path: str) -> Tuple[Dict[str, Any], str]:
-    """Read content from a markdown file and extract metadata."""
+    """Reads markdown file with optional YAML frontmatter.
+    
+    Args:
+        file_path: Path to markdown file
+        
+    Returns:
+        Tuple containing:
+        - Dictionary of parsed YAML metadata (empty dict if none)
+        - String of markdown content (without frontmatter)
+        
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        yaml.YAMLError: For malformed frontmatter
+    """
+
     with open(file_path, 'r', encoding='utf-8') as file:
         content = file.read()
         
@@ -27,14 +41,41 @@ def read_markdown_file(file_path: str) -> Tuple[Dict[str, Any], str]:
         return metadata, content
 
 def split_into_sections(content: str) -> List[str]:
-    """Split the markdown content into meaningful sections."""
+    """Splits markdown content into logical sections.
+    
+    Args:
+        content: Raw markdown text
+        
+    Returns:
+        List of section strings split by headers
+        
+    Notes:
+        - Uses '#', '##', etc. as section delimiters
+        - Filters out empty sections and "NO_CONTENT_HERE" markers
+    """
+
     # Split by headers (# or ## or ###)
     sections = re.split(r'(?=^#+ )', content, flags=re.MULTILINE)
     # Filter out empty sections and sections with just "NO_CONTENT_HERE"
     return [section.strip() for section in sections if section.strip() and "NO_CONTENT_HERE" not in section]
 
 def extract_facts_from_section(section: str) -> List[str]:
-    """Extract individual facts from a section."""
+    """Extracts discrete facts from a markdown section.
+    
+    Args:
+        section: Markdown content (may include header)
+        
+    Returns:
+        List of fact strings with:
+        - List items expanded
+        - Sentences separated
+        - Minimum 10 character length
+        
+    Notes:
+        - Preserves hierarchical list context
+        - Falls back to full content if no facts extracted
+    """
+
     # Extract the section title if it exists
     title_match = re.match(r'^#+ (.*?)$', section, re.MULTILINE)
     title = title_match.group(1).strip() if title_match else "Section"
@@ -73,7 +114,21 @@ def extract_facts_from_section(section: str) -> List[str]:
     return facts
 
 def process_list_items(list_text: str) -> List[str]:
-    """Process a list into individual fact items."""
+    """Processes markdown lists into structured facts.
+    
+    Args:
+        list_text: Markdown list content
+        
+    Returns:
+        List of processed items with:
+        - Sub-items linked to parents
+        - Continuation lines merged
+        
+    Example:
+        Input: "1. Main point\n   - Subpoint"
+        Output: ["Main point", "Main point - Subpoint"]
+    """
+
     facts = []
     
     # Split the list text into lines
@@ -114,9 +169,21 @@ def process_list_items(list_text: str) -> List[str]:
     return facts
 
 def split_into_sentences(text: str) -> List[str]:
+    """Advanced sentence splitting with edge case handling.
+    
+    Args:
+        text: Paragraph to split
+        
+    Returns:
+        List of sentences with:
+        - Abbreviations protected (e.g., "U.S.")
+        - Decimal numbers preserved
+        - Continuation lines merged
+        
+    Notes:
+        Uses PROTECTED marker internally during processing
     """
-    Split text into sentences, handling abbreviations and special cases.
-    """
+
     # Protect common abbreviations from being split
     protected_text = text
     protected_text = re.sub(r'(\w\.\w\.)', r'\1PROTECTED', protected_text)  # Protect abbreviations like U.S.
@@ -147,12 +214,34 @@ def split_into_sentences(text: str) -> List[str]:
     return processed_sentences
 
 def get_document_name_from_filename(filename: str) -> str:
-    """Extract document name from markdown filename."""
+    """Derives clean document name from filename.
+    
+    Args:
+        filename: Input filename (e.g., "doc.md")
+        
+    Returns:
+        Basename without extension (e.g., "doc")
+    """
+
     # Remove .md extension and use as document name
     return os.path.splitext(filename)[0]
 
 def save_output_to_file(data: List[Dict[str, Any]], output_dir: str, prefix: str) -> str:
-    """Save processed data to a JSON file with timestamp."""
+    """Saves JSON data with timestamped filename.
+    
+    Args:
+        data: List of QA pairs to save
+        output_dir: Target directory
+        prefix: Filename prefix (e.g., "train")
+        
+    Returns:
+        Absolute path to created file
+        
+    Notes:
+        - Creates output_dir if needed
+        - Uses format: "{prefix}-synthetic-data-{timestamp}.json"
+    """
+    
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     output_path = os.path.join(output_dir, f'{prefix}-synthetic-data-{timestamp}.json')
     

@@ -6,6 +6,20 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 class ColoredFormatter(logging.Formatter):
+    """Custom log formatter that adds color to console output based on log level.
+    
+    Attributes:
+        COLORS (dict): Mapping of log levels to colorama color codes:
+            - DEBUG: White
+            - INFO: Cyan
+            - WARNING: Yellow  
+            - ERROR: Red
+            - CRITICAL: Bright Red
+    
+    Methods:
+        format(record): Applies color formatting to log records
+    """
+
     COLORS = {
         'DEBUG': Fore.WHITE,
         'INFO': Fore.CYAN,
@@ -15,6 +29,15 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record):
+        """Formats log record with appropriate color coding.
+        
+        Args:
+            record (logging.LogRecord): Log record to format
+            
+        Returns:
+            str: Color-formatted log message with reset sequence
+        """
+
         color = self.COLORS.get(record.levelname, '')
         message = super().format(record)
         return f"{color}{message}{Style.RESET_ALL}"

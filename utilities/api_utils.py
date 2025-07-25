@@ -9,7 +9,26 @@ import re
 logger = setup_logger(__name__)
 
 def setup_lmdeploy_pipeline(model: str, num_gpus: int = 1, model_format: Optional[str] = None):
-    """Set up and return the lmdeploy pipeline."""
+    """Initializes and configures the LMDeploy inference pipeline.
+    
+    Args:
+        model: Identifier of the model to load (e.g., "OpenGVLab/InternVL3-8B")
+        num_gpus: Number of GPUs to distribute the model across (default: 1)
+        model_format: Optional model format specification (e.g., "llama", "hf")
+    
+    Returns:
+        Initialized pipeline object or None if setup fails
+    
+    Raises:
+        ImportError: If lmdeploy package is not available
+        RuntimeError: For configuration or initialization failures
+    
+    Notes:
+        - Applies nest_asyncio to enable nested event loops
+        - Configures system prompt for QA generation tasks
+        - Uses Turbomind backend by default
+    """
+
     try:
         
         # Apply nest_asyncio to allow nested event loops
@@ -79,7 +98,30 @@ def call_lmdeploy_api(
     max_tokens: int = 4096,
     top_k: int = 40
 ) -> List[str]:
-    """Call the LMDeploy API with prompts (optionally including images)."""
+    """Executes batched inference requests with optional image support.
+    
+    Args:
+        pipe: Initialized LMDeploy pipeline
+        prompts: List of prompt strings or dicts with structure:
+            {
+                "text": "prompt content",
+                "images": ["path1.jpg", ...]  # optional
+            }
+        max_tokens: Maximum number of tokens to generate (default: 4096)
+        top_k: Top-k sampling parameter (default: 40)
+    
+    Returns:
+        List of model response strings
+    
+    Raises:
+        ValueError: For malformed prompt structures
+        RuntimeError: For API communication failures
+    
+    Notes:
+        - Supports multi-modal prompts (text + images)
+        - Images are attached using URL format with dynamic patching
+    """
+
     responses = []
 
     for i, prompt in enumerate(prompts, 1):
@@ -116,6 +158,7 @@ def call_lmdeploy_api(
                     top_k=top_k
                 )
             )
+
             responses.append(response)
         
         except Exception as e:
@@ -125,7 +168,22 @@ def call_lmdeploy_api(
     return responses
 
 def get_json_str(string: str) -> str:
-    """Extract JSON string from text."""
+    """Extracts the first complete JSON object from a string.
+    
+    Args:
+        string: Input text potentially containing JSON
+    
+    Returns:
+        Extracted JSON string including outer braces
+    
+    Raises:
+        ValueError: If no valid JSON braces are found
+    
+    Example:
+        >>> get_json_str("Prefix {\\"key\\":\\"value\\"} suffix")
+        '{\\"key\\":\\"value\\"}'
+    """
+
     first = string.find('{')
     last = string.rfind('}')
     if first == -1 or last == -1 or first > last:
@@ -133,7 +191,18 @@ def get_json_str(string: str) -> str:
     return string[first:last + 1]
 
 def sanitize_json_str(text: str) -> str:
-    """Sanitizes JSON string by removing control characters before parsing"""
+    """Finds all image references in markdown content using {{FIGURE_X}} syntax.
+    
+    Args:
+        section_content: Markdown text to scan
+    
+    Returns:
+        List of found reference names (without braces)
+    
+    Example:
+        >>> extract_image_references("See {{FIGURE_1.2}} and {{TABLE_3}}")
+        ['FIGURE_1.2', 'TABLE_3']
+    """
 
     # Remove control characters except \t, \n, \r
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)

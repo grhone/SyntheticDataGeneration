@@ -3,8 +3,8 @@
 Synthetic Training Data Generator for LLM Fine-tuning
 
 This script processes markdown files and generates synthetic question-answer pairs,
-formatted for training Large Language Models (LLMs). It uses lmdeploy with InternVL3-8B model to generate
-QA pairs with different difficulty levels.
+formatted for training Large Language Models (LLMs). It uses lmdeploy with InternVL3-8B model (by default) 
+to generate QA pairs with different difficulty levels.
 
 """
 
@@ -45,12 +45,37 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 failed_sections = []
 
 def extract_image_references(section_content: str) -> List[str]:
-    """Extract image references like {{FIGURE_5.2}} from section content."""
+    """Finds all image references in markdown content using {{FIGURE_X}} syntax.
+    
+    Args:
+        section_content: Markdown text to scan
+    
+    Returns:
+        List of found reference names (without braces)
+    
+    Example:
+        >>> extract_image_references("See {{FIGURE_1.2}} and {{TABLE_3}}")
+        ['FIGURE_1.2', 'TABLE_3']
+    """
+
     pattern = r'\{\{([^}]+)\}\}'
     return re.findall(pattern, section_content)
 
 def resolve_image_paths(image_refs: List[str], document_name: str) -> List[str]:
-    """Convert image references to actual file paths."""
+    """Converts image references to valid filesystem paths.
+    
+    Args:
+        image_refs: List of reference names from extract_image_references()
+        document_name: Base document name for path resolution
+    
+    Returns:
+        List of absolute paths to existing image files
+    
+    Notes:
+        - Checks multiple possible locations including document subdirectories
+        - Logs warnings for missing images
+    """
+
     image_paths = []
     for ref in image_refs:
         # Try different possible paths
@@ -75,13 +100,43 @@ def resolve_image_paths(image_refs: List[str], document_name: str) -> List[str]:
     return image_paths
 
 def attach_images_to_section(section: str, document_name: str) -> Tuple[str, List[str]]:
-    """Process a section to find and attach images, returning updated content and image paths."""
+    """Processes a markdown section to extract and resolve image references.
+    
+    Args:
+        section: Markdown content containing image references
+        document_name: Base document name for path resolution
+    
+    Returns:
+        Tuple containing:
+        - Original section content (unchanged)
+        - List of resolved image paths (absolute paths)
+    
+    See Also:
+        :func:`extract_image_references` for reference extraction
+        :func:`resolve_image_paths` for path resolution logic
+    """
+
     image_refs = extract_image_references(section)
     image_paths = resolve_image_paths(image_refs, document_name)
     
     return section, image_paths
 
 def find_closest_sections(section: str, sections: List[str], section_idx: int) -> List[Dict[str, Any]]:
+    """Identifies semantically similar sections using TF-IDF and cosine similarity.
+    
+    Args:
+        section: Target section content to find neighbors for
+        sections: All available sections from the document
+        section_idx: 1-based index of the target section
+    
+    Returns:
+        List of similar section contents (excluding the target section)
+    
+    Notes:
+        - Uses sklearn's TF-IDF vectorizer with English stop words
+        - Limits text length to first 2000 characters per section
+        - Returns max 3 nearest neighbors
+    """
 
     # Preprocess sections for KNN
     section_texts = [sec[:2000] for sec in sections]  # Limit text length
@@ -107,8 +162,23 @@ def find_closest_sections(section: str, sections: List[str], section_idx: int) -
     return relevant_sections
 
 def get_closest_sections_text(section: str, sections: List[str], section_idx: int, document_name: str = "") -> Tuple[str, List[str]]:
-    """Get text of closest sections and their image paths.
-    Returns tuple of (section_text, image_paths)"""
+    """Retrieves text and images from related sections.
+    
+    Args:
+        section: Target section content
+        sections: All document sections
+        section_idx: 1-based index of target section
+        document_name: Optional document name for image resolution
+    
+    Returns:
+        Tuple containing:
+        - Concatenated text of related sections
+        - List of all image paths from related sections
+    
+    Notes:
+        Processes images in each related section through attach_images_to_section()
+    """
+
     relevant_sections = find_closest_sections(section, sections, section_idx)
     
     processed_sections = []
@@ -125,7 +195,34 @@ def get_closest_sections_text(section: str, sections: List[str], section_idx: in
     return relevant_sections_text, all_image_paths
 
 def generate_qa_pairs_bulk(pipe, sections: List[str], section_indices: List[int], question_type: QuestionType, all_sections: List[str], doc_metadata: Dict[str, Any], document_name: str = "") -> List[Dict[str, Any]]:
-    """Generate QA pairs in bulk for multiple sections with image support."""
+    """Generates QA pairs for multiple sections in a batch.
+    
+    Args:
+        pipe: Initialized LMDeploy pipeline
+        sections: List of markdown sections to process
+        section_indices: Corresponding 1-based indices for sections
+        question_type: Type of questions to generate (from QuestionType enum)
+        all_sections: Complete document content for context
+        doc_metadata: Document metadata dictionary
+        document_name: Optional document identifier for image resolution
+    
+    Returns:
+        List of QA pairs with structure:
+        {
+            "question": str,
+            "answer": str,
+            "question_images": List[str],
+            "question_type": str,
+            "difficulty": str,
+            "section_idx": int
+        }
+    
+    Notes:
+        - Handles retries for failed sections automatically
+        - For FACT_BASED questions, processes each fact individually
+        - Multi-hop questions require ≥2 valid sections
+    """
+
     prompts = []
     metadata = []
     
@@ -935,7 +1032,28 @@ Here is the section content:
     return qa_pairs
 
 def retry_failed_sections(pipe, failed_sections, all_sections, metadata, document_name=""):
-    """Retry processing for sections that previously failed"""
+    """Handles retry logic for sections that failed initial processing.
+    
+    Args:
+        pipe: Initialized LMDeploy pipeline
+        failed_sections: List of failed sections with structure:
+            {
+                'section_idx': int,
+                'content': str,
+                'question_type': str,
+                'error': str
+            }
+        all_sections: Complete document content
+        metadata: Document metadata dictionary
+        document_name: Optional document identifier
+    
+    Returns:
+        List of successfully processed QA pairs from retries
+    
+    Notes:
+        - Removes successfully processed sections from failed_sections list
+        - Maintains original error tracking for persistent failures
+    """
 
     logger.info("Retrying failed sections...")
 
@@ -970,36 +1088,51 @@ def retry_failed_sections(pipe, failed_sections, all_sections, metadata, documen
 
 
 def output_to_phi_format(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Converts QA pairs to OpenAI-compatible training format.
+    
+    Args:
+        data: List of QA pairs from generate_qa_pairs_bulk()
+    
+    Returns:
+        List of messages in format:
+        {
+            "messages": [
+                {"role": "user", "content": [...]},
+                {"role": "assistant", "content": "..."}
+            ],
+            "question_type": str,
+            "difficulty": str
+        }
+    
+    Notes:
+        - Preserves image references in user content
+        - Maintains original question metadata
     """
-    Converts received JSON to final JSON output format.
-    """
+
     formatted_data = []
 
     for item in data:
-        logger.debug(f"ITEM: {item}")
-
         question = item['question']
         question_images = item.get('question_images', [])
         answer = item['answer']
-        reasoning_steps = item['reasoning_steps']
         question_type = item.get('question_type', 'UNKNOWN')
         difficulty = item.get('difficulty', 'UNKNOWN')
 
-        # Build reasoning content if steps exist
-        reasoning_content = ""
-        if reasoning_steps:
+        # # Build reasoning content if steps exist
+        # reasoning_content = ""
+        # if reasoning_steps:
 
-            # If the steps are in a list of dicts, convert to string
-            step_strings = []
-            for step in reasoning_steps:
-                if isinstance(step, dict):
-                    # Convert dict to "key: value" pairs
-                    step_str = "\n".join(f"{k}: {v}" for k, v in step.items())
-                else:
-                    step_str = str(step)
-                step_strings.append(step_str)
+        #     # If the steps are in a list of dicts, convert to string
+        #     step_strings = []
+        #     for step in reasoning_steps:
+        #         if isinstance(step, dict):
+        #             # Convert dict to "key: value" pairs
+        #             step_str = "\n".join(f"{k}: {v}" for k, v in step.items())
+        #         else:
+        #             step_str = str(step)
+        #         step_strings.append(step_str)
             
-            reasoning_content = f"<think>\n{'\\n\\n'.join(step_strings)}\n</think>\n"
+        #     reasoning_content = f"<think>\n{'\\n\\n'.join(step_strings)}\n</think>\n"
 
         # Build user content with text and optional images
         user_content = [{"type": "text", "text": question}]
@@ -1021,18 +1154,43 @@ def output_to_phi_format(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 },
                 {
                     "role": "assistant",
-                    "content": f"{reasoning_content}{answer}"
+                    "content": f"{answer}"
                 }
             ],
             "question_type": question_type,
             "difficulty": difficulty
         }
-        
+
         formatted_data.append(response)
 
     return formatted_data
 
 def main():
+    """Orchestrates the synthetic data generation pipeline.
+    
+    System Flow:
+    1. Argument parsing (--check_urls mode)
+    2. LMDeploy pipeline initialization
+    3. Document processing loop:
+       a. Image validation
+       b. Section splitting
+       c. Batched QA generation (all question types)
+       d. Retry mechanism for failures
+    4. Output generation (train/eval split)
+    
+    Environment Variables:
+        MARKDOWN_DOCS_DIR: Input directory for markdown files
+        OUTPUT_DIR: Output directory for generated QA pairs
+        MODEL: LLM model identifier
+        NUM_GPUS: GPU allocation count
+        MAX_RETRIES: Maximum retry attempts per section
+    
+    Notes:
+        - Processes each markdown file independently
+        - Handles memory errors gracefully by skipping problematic files
+        - Summary questions are automatically assigned to eval set
+    """
+    
     # Add argument parsing
     parser = argparse.ArgumentParser(description='Generate synthetic training data or check image URLs')
     parser.add_argument('--check_urls', action='store_true', 
