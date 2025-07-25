@@ -1027,10 +1027,7 @@ def output_to_phi_format(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "question_type": question_type,
             "difficulty": difficulty
         }
-
-        # TODO: FOR DEBUGGING
-        logger.debug(f"RESPONSE: {response}")
-
+        
         formatted_data.append(response)
 
     return formatted_data
@@ -1085,6 +1082,8 @@ def main():
                 logger.info(f"Processing {file_path}...")
                 
                 # Read the markdown content
+                # TODO: INSTEAD OF LOADING CONTENT INTO MEMORY, GENERATE ALL THE PROMPTS AND STORE THEM, THEN REMOVE THEM AS THEY ARE COMPLETED.
+                # THE ISSUE IS THAT RIGHT NOW IF THE PROCESS GETS INTERRUPTED, THE FILE PROCESSING NEEDS TO START OVER, WHICH COULD BE HOURS OF LOST WORK.
                 metadata, content = read_markdown_file(file_path)
                 
                 # Extract document name for image folder check
@@ -1098,10 +1097,6 @@ def main():
                 batch_size = 100  # Adjust based on your API rate limits
                 
                 for question_type in QuestionType:
-
-                    # TODO: FOR DEBUGGING
-                    if(question_type != QuestionType.MULTI_HOP_REASONING):
-                        continue
 
                     logger.info(f"Generating {question_type.name} questions in bulk...")
                     
