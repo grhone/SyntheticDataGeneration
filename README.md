@@ -127,6 +127,7 @@ The system is configured through environment variables in the `.env` file:
 - `OUTPUT_DIR`: Output directory for generated data (default: output)
 - `MAX_RETRIES`: Maximum retry attempts for failed sections (default: 50)
 - `LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `LOG_FILE`: Optional path to log file (disables file logging if not set)
 
 ### Image URL Validation
 

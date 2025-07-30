@@ -44,6 +44,24 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Initialize the failed sections
 failed_sections = []
 
+def reset_failed_sections():
+    """Reset the global failed_sections tracking list.
+    
+    This function clears all entries from the module-level `failed_sections` list,
+    which tracks sections that failed during QA pair generation. This should be
+    called before processing each new question type to ensure clean tracking.
+    
+    Side Effects:
+        Modifies the global `failed_sections` variable by setting it to an empty list.
+        
+    Example:
+        >>> reset_failed_sections()
+        >>> print(failed_sections)
+        []
+    """
+    global failed_sections
+    failed_sections = []
+
 def extract_image_references(section_content: str) -> List[str]:
     """Finds all image references in markdown content using {{FIGURE_X}} syntax.
     
@@ -1190,7 +1208,7 @@ def main():
         - Handles memory errors gracefully by skipping problematic files
         - Summary questions are automatically assigned to eval set
     """
-    
+
     # Add argument parsing
     parser = argparse.ArgumentParser(description='Generate synthetic training data or check image URLs')
     parser.add_argument('--check_urls', action='store_true', 
@@ -1257,6 +1275,9 @@ def main():
                 for question_type in QuestionType:
 
                     logger.info(f"Generating {question_type.name} questions in bulk...")
+
+                    # Reset failed sections for each question type
+                    reset_failed_sections()
                     
                     # Prepare batches
                     for i in range(0, len(sections), batch_size):
