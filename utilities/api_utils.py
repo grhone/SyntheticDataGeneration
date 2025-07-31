@@ -3,39 +3,17 @@ import json
 from typing import List, Dict, Any, Union, Optional
 import nest_asyncio
 from lmdeploy import pipeline, TurbomindEngineConfig, ChatTemplateConfig, GenerationConfig
+from openai import OpenAI
 from utilities.logger import setup_logger
-import re 
+import re
+import base64
+import mimetypes
 
 logger = setup_logger(__name__)
 
-def setup_lmdeploy_pipeline(model: str, num_gpus: int = 1, model_format: Optional[str] = None):
-    """Initializes and configures the LMDeploy inference pipeline.
-    
-    Args:
-        model: Identifier of the model to load (e.g., "OpenGVLab/InternVL3-8B")
-        num_gpus: Number of GPUs to distribute the model across (default: 1)
-        model_format: Optional model format specification (e.g., "llama", "hf")
-    
-    Returns:
-        Initialized pipeline object or None if setup fails
-    
-    Raises:
-        ImportError: If lmdeploy package is not available
-        RuntimeError: For configuration or initialization failures
-    
-    Notes:
-        - Applies nest_asyncio to enable nested event loops
-        - Configures system prompt for QA generation tasks
-        - Uses Turbomind backend by default
-    """
-
-    try:
-        
-        # Apply nest_asyncio to allow nested event loops
-        nest_asyncio.apply()
-        
-        # System prompt for the model
-        system_prompt = f"""You are a meticulous synthetic data generator that creates high-quality training examples from document sections. Your role is to transform content into question-answer pairs while strictly adhering to these guidelines:
+def get_system_prompt():
+    """Returns the standardized system prompt for all inference engines."""
+    return f"""You are a meticulous synthetic data generator that creates high-quality training examples from document sections. Your role is to transform content into question-answer pairs while strictly adhering to these guidelines:
 
 1. DOCUMENT AND EXHIBIT REFERENCES:
    - Never refer to documents, exhibits, figures, or tables directly in the questions.
@@ -72,15 +50,18 @@ def setup_lmdeploy_pipeline(model: str, num_gpus: int = 1, model_format: Optiona
 
 Remember: You are creating training data that must work independently of the source document. Each question-answer pair should be fully understandable without referring back to the original material, except where minimal source attribution is absolutely necessary.
 """
+
+def setup_lmdeploy_pipeline(model: str, num_gpus: int = 1, model_format: Optional[str] = None):
+    """Initializes and configures the LMDeploy inference pipeline."""
+    try:
+        nest_asyncio.apply()
+        system_prompt = get_system_prompt()
         
-        # Initialize chat template configuration
         chat_template_config = ChatTemplateConfig('internvl2_5')
         chat_template_config.meta_instruction = system_prompt
         
-        # Initialize backend configuration
         backend_config = TurbomindEngineConfig(tp=num_gpus, model_format=model_format)
         
-        # Create the pipeline with the provided configurations
         pipe = pipeline(model, chat_template_config=chat_template_config, backend_config=backend_config)
         
         return pipe
@@ -91,6 +72,78 @@ Remember: You are creating training data that must work independently of the sou
     except Exception as e:
         logger.error(f"Error setting up lmdeploy pipeline: {e}")
         return None
+
+def setup_openrouter_client():
+    """Initializes the OpenRouter client using the OpenAI library."""
+    try:
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ.get("OPENROUTER_API_KEY"),
+        )
+        return client
+    except Exception as e:
+        logger.error(f"Error setting up OpenRouter client: {e}")
+        return None
+
+def encode_image_to_base64(image_path: str) -> str:
+    """Encodes an image file to a base64 string."""
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error encoding image {image_path}: {e}")
+        return None
+
+def get_image_mime_type(image_path: str) -> str:
+    """Determines the MIME type of an image file."""
+    mime_type, _ = mimetypes.guess_type(image_path)
+    return mime_type or 'application/octet-stream'
+
+def call_openrouter_api(
+    client: OpenAI,
+    prompts: List[Union[str, Dict[str, Any]]],
+    model: str,
+    max_tokens: int = 4096
+) -> List[Dict[str, Any]]:
+    """Executes batched inference requests using the OpenRouter API with image support."""
+    responses = []
+    system_prompt = get_system_prompt()
+
+    for i, prompt in enumerate(prompts, 1):
+        logger.info(f"Running prompt {i} of {len(prompts)}")
+        try:
+            content = []
+            text_prompt = prompt["text"] if isinstance(prompt, dict) else prompt
+            content.append({"type": "text", "text": text_prompt})
+
+            if isinstance(prompt, dict) and "images" in prompt and prompt["images"]:
+                for img_path in prompt["images"]:
+                    base64_image = encode_image_to_base64(img_path)
+                    if base64_image:
+                        mime_type = get_image_mime_type(img_path)
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}"
+                            }
+                        })
+
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content}
+                ],
+                max_tokens=max_tokens,
+            )
+            
+            responses.append({"text": completion.choices[0].message.content})
+
+        except Exception as e:
+            logger.error(f"Error calling OpenRouter API: {e}")
+            raise
+            
+    return responses
 
 def call_lmdeploy_api(
     pipe: pipeline,

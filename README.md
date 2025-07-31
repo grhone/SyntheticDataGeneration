@@ -1,16 +1,16 @@
 # Synthetic Training Data Generator for LLM Fine-tuning
 
-This repository contains a multi-modal synthetic data generation system that processes markdown documents and creates high-quality question-answer pairs for fine-tuning Large Language Models (LLMs). The system uses InternVL3 with advanced image processing capabilities and generates diverse question types with varying difficulty levels.
+This repository contains a multi-modal synthetic data generation system that processes markdown documents and creates high-quality question-answer pairs for fine-tuning Large Language Models (LLMs). The system supports both **LMDeploy** and **OpenRouter** for inference, uses InternVL3 with advanced image processing capabilities, and generates diverse question types with varying difficulty levels.
 
 ## Overview
 
 The project features a modular architecture with the following components:
 
 ### Core Script
-- `generate_synthetic_data.py` - Main script using lmdeploy with InternVL3-8B-AWQ model for sophisticated QA pair generation
+- `generate_synthetic_data.py` - Main script using either LMDeploy or OpenRouter for sophisticated QA pair generation.
 
 ### Utilities Module
-- `utilities/api_utils.py` - LMDeploy API integration with multi-modal support
+- `utilities/api_utils.py` - API integration for both LMDeploy and OpenRouter, with multi-modal support.
 - `utilities/file_utils.py` - Advanced markdown processing and fact extraction
 - `utilities/logger.py` - Colored logging system with configurable levels
 - `utilities/check_image_urls.py` - Image URL validation tool for generated datasets
@@ -67,6 +67,7 @@ The project features a modular architecture with the following components:
 ### Python Dependencies
 ```bash
 pip install lmdeploy[all]
+pip install openai
 pip install nest_asyncio
 pip install scikit-learn
 pip install python-dotenv
@@ -85,16 +86,22 @@ cd SyntheticDataGeneration
 
 2. **Install dependencies**
 ```bash
-pip install lmdeploy[all] nest_asyncio scikit-learn python-dotenv colorama pyyaml timm
+pip install lmdeploy[all] openai nest_asyncio scikit-learn python-dotenv colorama pyyaml timm
 ```
 
 3. **Configure environment variables**
 Create a `.env` file in the root directory:
 ```env
+# Inference Engine Configuration
+INFERENCE_ENGINE=lmdeploy  # 'lmdeploy' or 'openrouter'
+OPENROUTER_API_KEY=your_openrouter_api_key_here # Required if using openrouter
+
 # Model Configuration
+# For lmdeploy, use a local path or HuggingFace repo ID
+# For openrouter, use a model name like 'openai/gpt-4o'
 MODEL=OpenGVLab/InternVL3-8B-AWQ
-MODEL_FORMAT=awq
-NUM_GPUS=2
+MODEL_FORMAT=awq # Only for lmdeploy
+NUM_GPUS=2 # Only for lmdeploy
 
 # Processing Configuration
 MARKDOWN_DOCS_DIR=markdown_docs
@@ -120,9 +127,11 @@ python generate_synthetic_data.py
 ### Environment Variables
 The system is configured through environment variables in the `.env` file:
 
-- `MODEL`: Model identifier (default: OpenGVLab/InternVL3-8B-AWQ)
-- `MODEL_FORMAT`: Model format (awq, fp16, etc.)
-- `NUM_GPUS`: Number of GPUs to use (default: 1)
+- `INFERENCE_ENGINE`: The inference engine to use, either `lmdeploy` or `openrouter` (default: `lmdeploy`).
+- `OPENROUTER_API_KEY`: Your API key for OpenRouter (required if `INFERENCE_ENGINE` is `openrouter`).
+- `MODEL`: Model identifier. For `lmdeploy`, this can be a local path or a HuggingFace repo ID. For `openrouter`, use the model name from their catalog (e.g., `openai/gpt-4o`).
+- `MODEL_FORMAT`: Model format for `lmdeploy` (e.g., `awq`, `fp16`). Not used for `openrouter`.
+- `NUM_GPUS`: Number of GPUs to use for `lmdeploy` (default: 1). Not used for `openrouter`.
 - `MARKDOWN_DOCS_DIR`: Input directory for markdown files (default: markdown_docs)
 - `OUTPUT_DIR`: Output directory for generated data (default: output)
 - `MAX_RETRIES`: Maximum retry attempts for failed sections (default: 50)

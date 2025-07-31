@@ -34,6 +34,7 @@ MODEL = os.environ.get("MODEL", "OpenGVLab/InternVL3-8B")
 MODEL_FORMAT = os.environ.get("MODEL_FORMAT", None)
 NUM_GPUS = int(os.environ.get("NUM_GPUS", 1))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 50))
+INFERENCE_ENGINE = os.environ.get("INFERENCE_ENGINE", "lmdeploy")
 
 # Initialize logging 
 logger = setup_logger(__name__)
@@ -212,7 +213,7 @@ def get_closest_sections_text(section: str, sections: List[str], section_idx: in
         
     return relevant_sections_text, all_image_paths
 
-def generate_qa_pairs_bulk(pipe, sections: List[str], section_indices: List[int], question_type: QuestionType, all_sections: List[str], doc_metadata: Dict[str, Any], document_name: str = "") -> List[Dict[str, Any]]:
+def generate_qa_pairs_bulk(client, sections: List[str], section_indices: List[int], question_type: QuestionType, all_sections: List[str], doc_metadata: Dict[str, Any], document_name: str = "") -> List[Dict[str, Any]]:
     """Generates QA pairs for multiple sections in a batch.
     
     Args:
@@ -982,8 +983,14 @@ Here is the section content:
         
     logger.info(f"Prompts to run: {len(prompts)}")
 
-    # Call API for prompts 
-    responses = call_lmdeploy_api(pipe, prompts)
+    # Call API for prompts
+    if INFERENCE_ENGINE == "lmdeploy":
+        responses = call_lmdeploy_api(client, prompts)
+    elif INFERENCE_ENGINE == "openrouter":
+        responses = call_openrouter_api(client, prompts, model=MODEL)
+    else:
+        logger.error(f"Invalid inference engine: {INFERENCE_ENGINE}")
+        return []
     
     # Process responses
     qa_pairs = []
@@ -1049,7 +1056,7 @@ Here is the section content:
     
     return qa_pairs
 
-def retry_failed_sections(pipe, failed_sections, all_sections, metadata, document_name=""):
+def retry_failed_sections(client, failed_sections, all_sections, metadata, document_name=""):
     """Handles retry logic for sections that failed initial processing.
     
     Args:
@@ -1086,10 +1093,10 @@ def retry_failed_sections(pipe, failed_sections, all_sections, metadata, documen
 
             # Generate QA pairs for this retry
             qa_pairs = generate_qa_pairs_bulk(
-                pipe,
+                client,
                 [section['content']],
-                [section['section_idx']], 
-                QuestionType[section['question_type']], 
+                [section['section_idx']],
+                QuestionType[section['question_type']],
                 all_sections,
                 metadata,
                 document_name
@@ -1226,12 +1233,20 @@ def main():
             check_all_output_files(OUTPUT_DIR)
         return
     
-    # Set up lmdeploy pipeline if using LLM
-    pipe = None
-
-    pipe = setup_lmdeploy_pipeline(MODEL, NUM_GPUS, MODEL_FORMAT)
-    if pipe is None:
-        logger.error("Failed to set up lmdeploy pipeline - exiting.")
+    # Set up the appropriate client based on the environment variable
+    client = None
+    if INFERENCE_ENGINE == "lmdeploy":
+        client = setup_lmdeploy_pipeline(MODEL, NUM_GPUS, MODEL_FORMAT)
+        if client is None:
+            logger.error("Failed to set up lmdeploy pipeline - exiting.")
+            sys.exit(1)
+    elif INFERENCE_ENGINE == "openrouter":
+        client = setup_openrouter_client()
+        if client is None:
+            logger.error("Failed to set up OpenRouter client - exiting.")
+            sys.exit(1)
+    else:
+        logger.error(f"Invalid inference engine specified: {INFERENCE_ENGINE}")
         sys.exit(1)
     
     # Check to make sure all the images in each markdown file are valid so we can check for errors before continuing
@@ -1285,7 +1300,7 @@ def main():
                         batch_indices = list(range(i+1, i+len(batch_sections)+1))  # 1-based
                         
                         qa_pairs = generate_qa_pairs_bulk(
-                            pipe,
+                            client,
                             batch_sections,
                             batch_indices,
                             question_type,
@@ -1299,7 +1314,7 @@ def main():
                         retry_count = 0
                         while len(failed_sections) > 0 and retry_count < max_retries:
                             logger.info(f"\nRetry attempt {retry_count + 1}/{max_retries} for {len(failed_sections)} failed sections...")
-                            retry_results = retry_failed_sections(pipe, failed_sections, sections, metadata, document_name)
+                            retry_results = retry_failed_sections(client, failed_sections, sections, metadata, document_name)
                             qa_pairs.extend(retry_results)
                             retry_count += 1
                         
