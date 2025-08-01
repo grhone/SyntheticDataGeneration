@@ -36,6 +36,44 @@ The project features a modular architecture with the following components:
 - **Memory Management**: Handles large documents with memory error protection
 - **Metadata Support**: YAML frontmatter extraction and processing
 
+### YAML Frontmatter Documentation
+
+Markdown files should begin with optional YAML frontmatter for metadata. The system extracts this metadata for enhanced processing.
+
+#### Format Requirements:
+- Must be enclosed by `---` delimiters
+- Must be valid YAML syntax
+- Must appear at the very beginning of the file
+
+#### Example:
+```yaml
+---
+title: "Document Title"
+description: "Brief document summary"
+domain: "Topic domain"
+source: "Source organization"
+version: "Document version"
+last_updated: "YYYY-MM-DD"
+audience: "Intended readers"
+keywords: ["list", "of", "keywords"]
+---
+```
+
+#### Required Fields:
+- `title`: Document title
+- `description`: Brief summary of content
+
+#### Recommended Fields:
+- `domain`: Topic area (e.g., "Traffic Engineering")
+- `source`: Originating organization
+- `version`: Document version
+- `keywords`: List of search terms
+
+#### Processing Notes:
+- All fields become available in the generated QA pairs
+- Invalid YAML will be logged but won't stop processing
+- Missing required fields will generate warnings
+
 ### Question Types Supported
 
 | Question Type | Difficulty | Description |
