@@ -104,8 +104,13 @@ def call_openrouter_api(
     prompts: List[Union[str, Dict[str, Any]]],
     model: str,
     max_tokens: int = 4096
-) -> List[Dict[str, Any]]:
+) -> List[Any]:
     """Executes batched inference requests using the OpenRouter API with image support."""
+    
+    class OpenRouterResponse:
+        def __init__(self, text):
+            self.text = text
+
     responses = []
     system_prompt = get_system_prompt()
 
@@ -137,7 +142,8 @@ def call_openrouter_api(
                 max_tokens=max_tokens,
             )
             
-            responses.append({"text": completion.choices[0].message.content})
+            response_text = completion.choices[0].message.content
+            responses.append(OpenRouterResponse(text=response_text))
 
         except Exception as e:
             logger.error(f"Error calling OpenRouter API: {e}")
